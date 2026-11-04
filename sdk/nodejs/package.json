@@ -1,0 +1,25 @@
+{
+  "name": "atelier-sdk",
+  "version": "0.1.15",
+  "description": "Official Node.js / TypeScript Domain SDK for Atelier Kernel (Stdio JSON-Lines IPC, 4-stage receipts, and Storage-as-Messaging)",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "README.md",
+    "runtime.js",
+    "messages.js"
+  ],
+  "keywords": [
+    "atelier-kernel",
+    "microkernel",
+    "domain-sdk",
+    "ipc"
+  ],
+  "author": "Atelier Kernel Team",
+  "license": "MIT",
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}

@@ -1,0 +1,242 @@
+name: Build SDKs & Kernel Runtime Packages
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+
+permissions:
+  contents: write
+
+jobs:
+  ci-test:
+    name: Fast CI Verification (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Install Rust Stable Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo Registry & Target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run Kernel Unit & Integration Tests
+        run: cargo test
+
+      - name: Build Kernel for Native SDK Regression
+        run: cargo build --locked
+
+      - name: Run Cross-Language SDK Consistency Test Suite
+        shell: bash
+        run: |
+          if command -v python3 >/dev/null 2>&1 && python3 --version >/dev/null 2>&1; then
+            PY_BIN="python3"
+          else
+            PY_BIN="python"
+          fi
+          $PY_BIN tests/sdk_consistency_test.py
+          $PY_BIN tests/sdk_async_consistency_test.py
+          $PY_BIN tests/sdk_portable_features_test.py
+          $PY_BIN tests/sdk_transport_bounds_test.py
+          $PY_BIN tests/sdk_message_ids_test.py
+          $PY_BIN tests/sdk_terminal_wait_test.py
+          node --test tests/sdk_terminal_wait_test.cjs
+          $PY_BIN tests/sdk_observer_slow_test.py
+          $PY_BIN tests/sdk_log_slow_test.py
+          $PY_BIN tests/sdk_observer_memory_integration.py
+          $PY_BIN tests/sdk_self_restart_integration.py
+          $PY_BIN tests/sdk_log_pagination_integration.py
+          $PY_BIN tests/sdk_progress_state_test.py
+          $PY_BIN sdk/python/tests/test_module_logger.py
+
+  build-sdk-packages:
+    needs: [ci-test]
+    name: Build Domain SDKs (Python Wheel & Node.js NPM)
+    if: ${{ startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Build Python Wheel (.whl) & Node.js Package (.tgz)
+        run: |
+          mkdir -p dist/sdk
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          cp "docs/RELEASE_${version}.md" dist/sdk/RELEASE_NOTES.md
+          python3 sdk/python/build_wheel.py dist/sdk
+          cd sdk/nodejs && npm pack --pack-destination ../../dist/sdk
+
+      - name: Verify Python Wheel installation
+        run: |
+          pip install dist/sdk/atelier_sdk-*.whl
+          python3 -c "from atelier_sdk import AtelierDomain, __version__; print('Verified Python SDK version:', __version__)"
+
+      - name: Run Cross-Language SDK Consistency Test Suite
+        run: |
+          python3 tests/sdk_consistency_test.py
+          python3 tests/sdk_async_consistency_test.py
+          python3 tests/sdk_portable_features_test.py
+          python3 tests/sdk_transport_bounds_test.py
+          python3 tests/sdk_message_ids_test.py
+          python3 tests/sdk_terminal_wait_test.py
+          node --test tests/sdk_terminal_wait_test.cjs
+          python3 tests/sdk_observer_slow_test.py
+          python3 tests/sdk_log_slow_test.py
+          python3 tests/sdk_progress_state_test.py
+
+      - name: Upload SDK Packages Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: atelier-domain-sdks
+          path: dist/sdk/*
+
+  build-kernel-runtime:
+    needs: [ci-test]
+    name: Build Precompiled Kernel Runtime (${{ matrix.target_label }})
+    if: ${{ startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target_label: linux-x86_64
+            bin_name: atelier-kernel
+          - os: windows-latest
+            target_label: windows-x86_64
+            bin_name: atelier-kernel.exe
+          - os: macos-latest
+            target_label: macos-arm64
+            bin_name: atelier-kernel
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Install Rust Stable Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo Registry & Target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run Kernel Unit & Integration Tests
+        run: cargo test
+
+      - name: Build Release Kernel Binary
+        run: cargo build --release
+
+      - name: Assemble Kernel Runtime Bundle
+        shell: bash
+        run: |
+          if command -v python3 >/dev/null 2>&1 && python3 --version >/dev/null 2>&1; then
+            PY_BIN="python3"
+          else
+            PY_BIN="python"
+          fi
+          mkdir -p dist/kernel-runtime-${{ matrix.target_label }}
+          cp target/release/${{ matrix.bin_name }} dist/kernel-runtime-${{ matrix.target_label }}/
+          cp kernel_boot.json dist/kernel-runtime-${{ matrix.target_label }}/kernel_boot.template.json
+          cp VARIANT_GUIDE.md dist/kernel-runtime-${{ matrix.target_label }}/VARIANT_GUIDE.md
+          cp README.md CONSTITUTION.md ARCHITECTURE.md SDK_CONTRACT.md MESSAGE_IDENTITY.md ADVERSARIAL_AUDIT.md RELEASE_NOTES_v0.1.8.md dist/kernel-runtime-${{ matrix.target_label }}/
+          cp -R docs dist/kernel-runtime-${{ matrix.target_label }}/docs
+          mkdir -p dist/kernel-runtime-${{ matrix.target_label }}/sdk/python dist/kernel-runtime-${{ matrix.target_label }}/sdk/nodejs
+          cp sdk/python/README.md dist/kernel-runtime-${{ matrix.target_label }}/sdk/python/README.md
+          cp sdk/nodejs/README.md dist/kernel-runtime-${{ matrix.target_label }}/sdk/nodejs/README.md
+          $PY_BIN sdk/python/build_wheel.py dist/kernel-runtime-${{ matrix.target_label }}/sdk
+          (cd sdk/nodejs && npm pack --pack-destination ../../dist/kernel-runtime-${{ matrix.target_label }}/sdk)
+          tar -C dist -czf dist/atelier-kernel-runtime-${{ matrix.target_label }}.tar.gz kernel-runtime-${{ matrix.target_label }}
+
+      - name: End-to-End Variant Smoke Test (--init + --smoke-test)
+        shell: bash
+        run: |
+          if command -v python3 >/dev/null 2>&1 && python3 --version >/dev/null 2>&1; then
+            PY_BIN="python3"
+          else
+            PY_BIN="python"
+          fi
+          wheels=(dist/kernel-runtime-${{ matrix.target_label }}/sdk/atelier_sdk-*.whl)
+          $PY_BIN -m pip install "${wheels[0]}"
+          export PYTHONPATH="$(pwd)/${wheels[0]}"
+          ./dist/kernel-runtime-${{ matrix.target_label }}/${{ matrix.bin_name }} --init ./ci-smoke-variant
+          ./dist/kernel-runtime-${{ matrix.target_label }}/${{ matrix.bin_name }} --config ./ci-smoke-variant/kernel_boot.json --smoke-test
+          rm -rf ./ci-smoke-variant
+
+      - name: Upload Kernel Runtime Artifact (${{ matrix.target_label }})
+        uses: actions/upload-artifact@v7
+        with:
+          name: atelier-kernel-runtime-${{ matrix.target_label }}
+          path: dist/atelier-kernel-runtime-${{ matrix.target_label }}.tar.gz
+
+  publish-github-release:
+    name: Publish GitHub Release (on v* tag)
+    needs: [ci-test, build-sdk-packages, build-kernel-runtime]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download All Built Artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            release-assets/*.whl
+            release-assets/*.tgz
+            release-assets/*.tar.gz
+          body_path: release-assets/RELEASE_NOTES.md
+          generate_release_notes: true
