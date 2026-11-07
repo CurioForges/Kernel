@@ -657,6 +657,7 @@ fn test_unified_multi_state_logging_and_hub_logs_persistence() {
         waiting: false,
         done: false,
         state: None,
+        source_instance: None,
     });
 
     // 3. Log ephemeral progress: downloading weights
