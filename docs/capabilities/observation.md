@@ -47,7 +47,7 @@ await domain.unsubscribe_notify()
 
 身份是 `(内核绑定的 source_domain, key)`，不同域的同名 `key` 互不干扰。`frac` 是比例，`waiting` 表示排队，`state` 取 `running` / `completed` / `failed` / `cancelled`。终态更新必须复用原 `key`。`done` 只是终止兼容字段，**不能当成功标志**。详见 [进度状态](progress.md)。
 
-`query_progress()` 返回当前活动条目，不是完成历史；终态会移出活动集合，**查不到不代表成功**。
+`query_progress()` 返回当前活动条目，不是完成历史；终态会移出活动集合，**查不到不代表成功**。域进程实例停止、崩溃、滚动更新或重启时，内核会按实例清理它遗留的活动进度，避免旧 `queued/running` 条目永久出现在初始快照中。
 
 实时副本允许丢失；进度 `key` 与消息 ID 之间没有内核自动映射，需上报方自己提供业务关联信息。
 

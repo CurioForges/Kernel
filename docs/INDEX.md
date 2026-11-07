@@ -42,10 +42,10 @@
 
 | 文档 | 内容 |
 | :--- | :--- |
-| [releases/RELEASE_0.3.3.md](releases/RELEASE_0.3.3.md) | 当前版本：日志级别写入侧统一大写 + 历史迁移 + 级别筛选大小写无关 |
-| [releases/RELEASE_0.3.2.md](releases/RELEASE_0.3.2.md) | 上一版：内核累计计数（真速率）与观察流丢弃计数 |
-| [releases/RELEASE_0.3.1.md](releases/RELEASE_0.3.1.md) | 上一版：SDK 收缩为只做协议传输、去掉超时/窗口/TTL 策略、传输失败不再沉默 |
-| [releases/RELEASE_0.3.0.md](releases/RELEASE_0.3.0.md) | 上一版：分层落定、SDK 契约收敛、门禁补齐、破坏性变更与升级方式 |
+| [releases/RELEASE_0.5.2.md](releases/RELEASE_0.5.2.md) | 当前版本：域进程实例退出时回收 active progress |
+| [releases/RELEASE_0.5.1.md](releases/RELEASE_0.5.1.md) | 上一版：C4 对象 id 改为 UUID |
+| [releases/RELEASE_0.5.0.md](releases/RELEASE_0.5.0.md) | 上一版：C4 文件对象收敛为 4 个操作 |
+| [releases/RELEASE_0.4.0.md](releases/RELEASE_0.4.0.md) | 上一版：内核契约与能力分层 |
 
 ## 归档
 
