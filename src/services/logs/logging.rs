@@ -426,6 +426,7 @@ impl LogStore {
                 waiting: false,
                 done: false,
                 state: None,
+                source_instance: None,
             })
         })?;
 
@@ -532,7 +533,13 @@ impl KernelLogHub {
 
     /// Core relay entry point: reinjects a structured log record from remote child domains or internal kernel subsystems.
     /// Preserves complete field fidelity (level, layer, component, phase, key, frac, waiting, done).
-    pub fn reinject(&self, mut record: LogRecord) {
+    pub fn reinject(&self, record: LogRecord) {
+        self.reinject_from(record, None);
+    }
+
+    /// Reinject a record with the owning process generation, used for crash/restart cleanup.
+    pub fn reinject_from(&self, mut record: LogRecord, source_instance: Option<u64>) {
+        record.source_instance = source_instance;
         // level 的规范形式是大写（与内核自身日志、查询筛选、控制台着色一致）。
         record.level = normalize_level(&record.level);
         if record.source_domain.is_none() {
@@ -614,6 +621,20 @@ impl KernelLogHub {
     /// Returns a snapshot of currently active in-flight progress records.
     pub fn active_progress(&self) -> Vec<LogRecord> {
         self.active_progress.lock().values().cloned().collect()
+    }
+
+    /// Removes active progress emitted by one exact domain process generation.
+    pub fn clear_instance_progress(&self, domain: &str, instance_id: u64) {
+        let mut progress_map = self.active_progress.lock();
+        progress_map.retain(|(source, _), record| {
+            !(source == domain && record.source_instance == Some(instance_id))
+        });
+    }
+
+    /// Removes active progress for a domain without a process generation (in-process domains).
+    pub fn clear_domain_progress(&self, domain: &str) {
+        let mut progress_map = self.active_progress.lock();
+        progress_map.retain(|(source, _), _| source != domain);
     }
 
     /// Legacy live snapshot for the built-in console; never merged into persisted history pages.
@@ -721,6 +742,7 @@ impl KernelLogHub {
             waiting,
             done,
             state: None,
+            source_instance: None,
         });
     }
 
@@ -741,6 +763,7 @@ impl KernelLogHub {
             waiting: false,
             done: false,
             state: None,
+            source_instance: None,
         });
     }
 
@@ -886,6 +909,38 @@ mod progress_state_tests {
             assert_eq!(active[0].source_domain.as_deref(), Some("b"));
         }
     }
+    #[test]
+    fn instance_cleanup_removes_only_the_restarted_generation() {
+        let hub = KernelLogHub::new(None).unwrap();
+        let add = |domain: &str, key: &str, instance: u64| {
+            hub.reinject_from(
+                LogRecord {
+                    source_domain: Some(domain.into()),
+                    ephemeral: true,
+                    key: Some(key.into()),
+                    ..Default::default()
+                },
+                Some(instance),
+            );
+        };
+        add("a", "one", 1);
+        add("a", "two", 2);
+        add("b", "one", 3);
+        assert_eq!(hub.active_progress().len(), 3);
+
+        hub.clear_instance_progress("a", 1);
+        let active = hub.active_progress();
+        assert_eq!(active.len(), 2);
+        assert!(active.iter().any(|r| r.source_domain.as_deref() == Some("a")
+            && r.source_instance == Some(2)));
+        assert!(active.iter().any(|r| r.source_domain.as_deref() == Some("b")));
+
+        hub.clear_instance_progress("a", 2);
+        assert_eq!(hub.active_progress().len(), 1);
+        hub.clear_domain_progress("b");
+        assert!(hub.active_progress().is_empty());
+    }
+
     #[test]
     fn legacy_done_and_explicit_running_precedence() {
         let hub = KernelLogHub::new(None).unwrap();

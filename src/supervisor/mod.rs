@@ -740,6 +740,9 @@ impl DomainSupervisorInner {
                 .mark_domain_faulted_for_instance(id, Some(process.instance_id), reason);
         }
         process.terminate();
+        self.router
+            .logger()
+            .clear_instance_progress(id, process.instance_id);
         // No state/router locks are held while killing, waiting, or joining workers.
         let mut state = control.state.lock();
         if process.child.is_some() {
@@ -772,7 +775,11 @@ impl DomainSupervisorInner {
             if drained || Instant::now() >= old.deadline || self.shutdown.load(Ordering::Acquire) {
                 self.router
                     .cleanup_draining_instance(&old.domain, old.process.instance_id);
+                let old_instance = old.process.instance_id;
                 old.process.terminate();
+                self.router
+                    .logger()
+                    .clear_instance_progress(&old.domain, old_instance);
                 if old.process.child.is_some() {
                     self.retiring.lock().push(old);
                 }
@@ -954,7 +961,12 @@ impl DomainSupervisor {
         }
         let retiring = std::mem::take(&mut *self.inner.retiring.lock());
         for mut old in retiring {
+            let old_instance = old.process.instance_id;
             old.process.terminate();
+            self.inner
+                .router
+                .logger()
+                .clear_instance_progress(&old.domain, old_instance);
         }
         self.inner.forwarders.lock().clear();
     }
@@ -1070,6 +1082,7 @@ impl DomainSupervisor {
                 None,
                 "domain stopped by kernel supervisor",
             );
+            self.inner.router.logger().clear_domain_progress(id);
             false
         }
     }
@@ -1180,6 +1193,10 @@ impl DomainSupervisor {
                 candidate.output.failure()
             );
             candidate.terminate();
+            self.inner
+                .router
+                .logger()
+                .clear_instance_progress(id, generation);
             return Err(SupervisorError::UpdateValidationFailed {
                 domain: id.into(),
                 reason: format!("candidate exited or failed application readiness: {failure}"),
@@ -1202,6 +1219,10 @@ impl DomainSupervisor {
             }
             self.inner.router.abort_candidate(id, generation);
             candidate.terminate();
+            self.inner
+                .router
+                .logger()
+                .clear_instance_progress(id, generation);
             return Err(SupervisorError::UpdateValidationFailed {
                 domain: id.into(),
                 reason: format!("ingress switch failed: {error}"),
@@ -1213,6 +1234,10 @@ impl DomainSupervisor {
             }
             self.inner.router.abort_candidate(id, generation);
             candidate.terminate();
+            self.inner
+                .router
+                .logger()
+                .clear_instance_progress(id, generation);
             return Err(SupervisorError::UpdateValidationFailed {
                 domain: id.into(),
                 reason: "candidate lost readiness before commit".into(),
@@ -1229,13 +1254,22 @@ impl DomainSupervisor {
             state.process.replace(candidate)
         };
         if let Some(mut old) = previous {
+            let old_instance = old.instance_id;
             if old.bindings.is_empty() {
                 thread::sleep(Duration::from_millis(600));
                 self.inner
                     .router
                     .cleanup_draining_instance(id, old.instance_id);
                 old.terminate();
+                self.inner
+                    .router
+                    .logger()
+                    .clear_instance_progress(id, old_instance);
             } else {
+                self.inner
+                    .router
+                    .logger()
+                    .clear_instance_progress(id, old_instance);
                 self.inner.retiring.lock().push(RetiringProcess {
                     domain: id.into(),
                     process: old,

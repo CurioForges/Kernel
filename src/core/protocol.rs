@@ -71,6 +71,9 @@ pub struct LogRecord {
     pub done: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<ProgressState>,
+    /// Kernel-internal owner process generation. Never serialized to domains or web clients.
+    #[serde(skip)]
+    pub source_instance: Option<u64>,
 }
 
 impl Default for LogRecord {
@@ -91,6 +94,7 @@ impl Default for LogRecord {
             waiting: false,
             done: false,
             state: None,
+            source_instance: None,
         }
     }
 }

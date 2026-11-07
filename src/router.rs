@@ -934,7 +934,7 @@ impl KernelRouter {
                 if record.layer.is_empty() {
                     record.layer = "DOMAIN".to_string();
                 }
-                self.logger.reinject(record);
+                self.logger.reinject_from(record, Some(instance_id));
                 None
             }
         }
