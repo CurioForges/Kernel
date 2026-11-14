@@ -69,6 +69,37 @@ jobs:
           "release: $latest -> $next  (bump=$bump)"
           "subject: $subject"
 
+      - name: Bump package versions
+        shell: pwsh
+        run: |
+          $v = $env:version
+          $cargo = 'Cargo.toml'
+          $t = Get-Content $cargo -Raw
+          $t = [regex]::Replace($t, '(?m)^version = "[^"]+"', "version = `"$v`"", 1)
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) $cargo), $t, (New-Object System.Text.UTF8Encoding($false)))
+          $pj = 'sdk/nodejs/package.json'
+          if (Test-Path $pj) {
+            $j = Get-Content $pj -Raw | ConvertFrom-Json
+            $j.version = $v
+            [System.IO.File]::WriteAllText((Join-Path (Get-Location) $pj), ($j | ConvertTo-Json -Depth 20), (New-Object System.Text.UTF8Encoding($false)))
+          }
+          Get-ChildItem sdk/python -Recurse -Filter '__init__.py' -ErrorAction SilentlyContinue |
+            Where-Object { (Get-Content $_.FullName -Raw) -match '__version__' } |
+            ForEach-Object {
+              $x = Get-Content $_.FullName -Raw
+              $x = [regex]::Replace($x, '(__version__\s*=\s*)"[^"]+"', ('$1"' + $v + '"'))
+              [System.IO.File]::WriteAllText($_.FullName, $x, (New-Object System.Text.UTF8Encoding($false)))
+            }
+          git config user.name 'Atelier Release'
+          git config user.email 'release@atelier.local'
+          git add -A Cargo.toml sdk
+          git commit -q -m "release: v$v"
+          if ($LASTEXITCODE -eq 0) {
+            git push origin HEAD:master 2>$null
+            if ($LASTEXITCODE -ne 0) { "WARN: 版本提交未推送（非快进），构建继续" }
+          }
+          "versions bumped to $v"
+
       - name: Build kernel binary
         shell: pwsh
         run: |
