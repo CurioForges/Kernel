@@ -25,6 +25,7 @@ concurrency:
 
 jobs:
   release:
+    if: "!startsWith(github.event.head_commit.message, 'release:')"
     runs-on: windows-x64
     timeout-minutes: 60
     env:
@@ -93,7 +94,7 @@ jobs:
           git config user.name 'Atelier Release'
           git config user.email 'release@atelier.local'
           git add -A Cargo.toml sdk
-          git commit -q -m "release: v$v"
+          git commit -q -m "release: v$v [skip ci]"
           if ($LASTEXITCODE -eq 0) {
             git push origin HEAD:master 2>$null
             if ($LASTEXITCODE -ne 0) { "WARN: 版本提交未推送（非快进），构建继续" }
