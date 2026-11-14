@@ -6,6 +6,11 @@ name: Kernel release
 on:
   push:
     branches: [master]
+    paths-ignore:
+      - '.gitea/**'
+      - 'ci/**'
+      - 'docs/**'
+      - '**/*.md'
   workflow_dispatch:
     inputs:
       bump:
