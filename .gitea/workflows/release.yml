@@ -1,0 +1,137 @@
+name: Kernel release
+
+# 内核发版：编译 runtime + 双 SDK → 发 Gitea release → 按 topic 通用通知所有域仓库。
+# 域仓库列表不写死：查询 topic=atelier-domain 的所有仓库，没有 artifact.yml 的自动跳过。
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 版本号（如 0.5.3）；留空则取 Cargo.toml 的 version
+        required: false
+        default: ""
+      publish:
+        description: 真正发布到 Gitea release（关闭时只构建、不发布、不通知）
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: windows-x64
+    timeout-minutes: 60
+    env:
+      GITEA_TOKEN: ${{ secrets.ATELIER_PAT }}
+      GITEA_URL: https://atelier.hurcaguari.top
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.ATELIER_PAT }}
+          fetch-depth: 1
+
+      - name: Resolve version and toolchain
+        id: ver
+        shell: pwsh
+        run: |
+          $v = "${{ inputs.version }}"
+          if (-not $v) {
+            $line = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+            $v = $line.Matches[0].Groups[1].Value
+          }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          "KERNEL_VERSION=$v" >> $env:GITHUB_ENV
+          . .\ci\gitea-release.ps1 -Repo 'core-kernel'
+          "cargo : $((& cargo --version) 2>&1)"
+          "node  : $((& node --version) 2>&1)"
+          "python: $((& python --version) 2>&1)"
+          "version = $v"
+
+      - name: Build kernel binary
+        shell: pwsh
+        run: |
+          cargo build --release
+          $bin = 'target\release\atelier-kernel.exe'
+          if (-not (Test-Path $bin)) { throw "kernel binary missing: $bin" }
+          "built: $([math]::Round((Get-Item $bin).Length/1MB,1)) MB"
+
+      - name: Build SDK packages
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist\sdk | Out-Null
+          & python sdk\python\build_wheel.py dist\sdk
+          if ($LASTEXITCODE -ne 0) { throw "python wheel build failed" }
+          Push-Location sdk\nodejs
+          try { & npm pack --pack-destination ..\..\dist\sdk } finally { Pop-Location }
+          if ($LASTEXITCODE -ne 0) { throw "npm pack failed" }
+          Get-ChildItem dist\sdk | ForEach-Object { "  sdk: $($_.Name)" }
+
+      - name: Assemble runtime bundle
+        shell: pwsh
+        run: |
+          $label = 'windows-x86_64'
+          $rt = "dist\kernel-runtime-$label"
+          New-Item -ItemType Directory -Force "$rt\sdk\python","$rt\sdk\nodejs" | Out-Null
+          Copy-Item target\release\atelier-kernel.exe $rt -Force
+          Copy-Item kernel_boot.json "$rt\kernel_boot.template.json" -Force
+          Copy-Item README.md $rt -Force
+          Copy-Item docs $rt -Recurse -Force
+          Copy-Item sdk\python\README.md "$rt\sdk\python\README.md" -Force
+          Copy-Item sdk\nodejs\README.md "$rt\sdk\nodejs\README.md" -Force
+          Copy-Item dist\sdk\* "$rt\sdk" -Force
+          $zip = "dist\Atelier-Kernel-runtime-$label-v$env:KERNEL_VERSION.zip"
+          Compress-Archive -Path "$rt\*" -DestinationPath $zip -Force
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $(Split-Path -Leaf $zip)" | Set-Content "$zip.sha256" -Encoding ASCII
+          Get-ChildItem dist\sdk\*.whl | ForEach-Object {
+            $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$h  $($_.Name)" | Set-Content "$($_.FullName).sha256" -Encoding ASCII
+          }
+          "runtime zip: $([math]::Round((Get-Item $zip).Length/1MB,1)) MB"
+
+      - name: Publish release
+        if: ${{ inputs.publish || startsWith(github.ref, 'refs/tags/v') }}
+        shell: pwsh
+        run: |
+          . .\ci\gitea-release.ps1 -Repo 'core-kernel'
+          $tag = "v$env:KERNEL_VERSION"
+          $null = Gitea-EnsureRelease -Tag $tag -Title "Atelier Kernel $tag" -Notes "Kernel runtime and SDK packages for $tag"
+          $assets = @()
+          $assets += Get-ChildItem dist\Atelier-Kernel-runtime-*.zip | Select-Object -ExpandProperty FullName
+          $assets += Get-ChildItem dist\Atelier-Kernel-runtime-*.zip.sha256 | Select-Object -ExpandProperty FullName
+          $assets += Get-ChildItem dist\sdk\*.whl | Select-Object -ExpandProperty FullName
+          $assets += Get-ChildItem dist\sdk\*.whl.sha256 | Select-Object -ExpandProperty FullName
+          $assets += Get-ChildItem dist\sdk\*.tgz | Select-Object -ExpandProperty FullName
+          foreach ($a in $assets) {
+            $null = Gitea-UploadAsset -Tag $tag -Path $a -Clobber
+            "  ↑ $(Split-Path -Leaf $a)"
+          }
+          "assets: " + ((Gitea-ReleaseAssetNames -Tag $tag) -join ', ')
+
+      - name: Notify all domain repos
+        if: ${{ inputs.publish || startsWith(github.ref, 'refs/tags/v') }}
+        shell: pwsh
+        run: |
+          # 通用规则：按 topic 找域仓库，不写死任何仓库名。
+          # 没有 artifact.yml 的仓库会被跳过，不影响其他仓库。
+          $token = $env:GITEA_TOKEN
+          $headers = @{ Authorization = "token $token" }
+          $found = Invoke-RestMethod -Uri "$env:GITEA_URL/api/v1/repos/search?q=atelier-domain&topic=true&limit=50" -Headers $headers -TimeoutSec 30
+          $dispatched = 0; $skipped = 0
+          foreach ($repo in $found.data) {
+            $body = @{
+              ref = 'master'
+              inputs = @{ kernel_version = $env:KERNEL_VERSION; sdk_version = $env:KERNEL_VERSION }
+            } | ConvertTo-Json -Compress
+            $url = "$env:GITEA_URL/api/v1/repos/$($repo.full_name)/actions/workflows/artifact.yml/dispatches"
+            try {
+              Invoke-RestMethod -Uri $url -Method Post -Headers $headers -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 30 | Out-Null
+              "  dispatched $($repo.name)"
+              $dispatched++
+            } catch {
+              "  skip $($repo.name) (无 artifact.yml 或权限不足)"
+              $skipped++
+            }
+          }
+          "domain repos: dispatched=$dispatched skipped=$skipped"
