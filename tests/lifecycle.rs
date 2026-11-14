@@ -12,3 +12,6 @@ mod ports;
 mod diagnostics;
 #[path = "cases/lifecycle/registration.rs"]
 mod registration;
+#[cfg(windows)]
+#[path = "cases/lifecycle/shutdown.rs"]
+mod shutdown;

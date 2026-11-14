@@ -5,6 +5,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+mod shutdown;
+
 use atelier_kernel::{
     AtelierKernel, ContractStatus, DomainStatus, InteractiveFrontendDomain, KernelBootConfig,
     KernelToDomainFrame, WebFrontendDomain, check_constitution,
@@ -359,6 +362,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Default: Headless microkernel runtime without HTTP server port overhead
+    #[cfg(windows)]
+    let shutdown_event = shutdown::ShutdownEvent::new()?;
     let kernel = AtelierKernel::open_with_db_and_root(&boot_config.db_path, &boot_config.project_root)?;
     let spawned = kernel.supervisor().boot_from_config(&boot_config);
     println!(
@@ -369,7 +374,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "  Web UI is disabled by default. Pass --web-ui / --dashboard or set \"web_ui_enabled\": true to enable observation console."
     );
-    loop {
-        thread::sleep(Duration::from_secs(3600));
+    #[cfg(windows)]
+    {
+        shutdown_event.wait()?;
+        Ok(()) // Dropping the kernel runs the existing supervisor shutdown and reclamation.
     }
+    #[cfg(not(windows))]
+    loop { thread::sleep(Duration::from_secs(3600)); }
 }
