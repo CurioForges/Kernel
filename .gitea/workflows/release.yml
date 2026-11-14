@@ -55,9 +55,9 @@ jobs:
           "TAG=$next"         >> $env:GITHUB_ENV
           $sha = (git rev-parse HEAD).Trim()
           "sha=$sha"          >> $env:GITHUB_OUTPUT
-          $subject = (git log -1 --pretty=%s).Trim()
-          $body = (git log -1 --pretty=%b).Trim()
-          $changes = if ($tags.Count -gt 0) { (git log --pretty='- %s (%h)' "$latest..HEAD").Trim() } else { '' }
+          $subject = ("$(git log -1 --pretty=%s)").Trim()
+          $body = ("$(git log -1 --pretty=%b)").Trim()
+          $changes = if ($tags.Count -gt 0) { (@(git log --pretty='- %s (%h)' "$latest..HEAD") -join "`n").Trim() } else { '' }
           $notes = @($subject, '', $body, '', '### Changes since ' + $latest, $changes) -join "`n"
           $notes = $notes.Trim()
           [System.IO.File]::WriteAllText((Join-Path (Get-Location) 'release-notes.md'), $notes, (New-Object System.Text.UTF8Encoding($false)))
