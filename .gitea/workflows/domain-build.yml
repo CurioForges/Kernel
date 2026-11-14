@@ -1,0 +1,245 @@
+name: Domain build (shared)
+
+# 可复用工作流：由各域仓库用 uses: 调用，避免每个仓库复制一份。
+#   uses: self:Atelier/core-kernel/.gitea/workflows/domain-build.yml@master
+#   with: { domain: engines, asset_prefix: AtelierEngines }
+#
+# 覆盖 Nuitka 打包类域（engines / pipelines / scheduler）。
+# web（Node SEA）与 video（插件 + smoke）仍保留各自仓库的工作流。
+
+on:
+  workflow_call:
+    inputs:
+      domain:
+        required: true
+        type: string
+      asset_prefix:
+        required: true
+        type: string
+      kernel_version:
+        required: false
+        type: string
+        default: ""
+      sdk_version:
+        required: false
+        type: string
+        default: ""
+      extra_build_step:
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  build:
+    runs-on: windows-x64
+    timeout-minutes: 90
+    env:
+      GITEA_TOKEN: ${{ secrets.ATELIER_PAT }}
+      GITEA_URL: https://atelier.hurcaguari.top
+      DOMAIN: ${{ inputs.domain }}
+      ASSET_PREFIX: ${{ inputs.asset_prefix }}
+      KERNEL_VERSION: ${{ inputs.kernel_version }}
+      SDK_VERSION: ${{ inputs.sdk_version }}
+      SOURCE_SHA: ${{ github.sha }}
+      PYTHON_VERSION: "3.11"
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.ATELIER_PAT }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Decide build
+        id: decide
+        shell: pwsh
+        run: |
+          $rec = $null
+          if (Test-Path '.atelier/version.json') { $rec = Get-Content '.atelier/version.json' -Raw | ConvertFrom-Json }
+          $build = $true; $reason = 'no previous build record'
+          if ($rec -and $rec.source_sha) {
+            $diff = @(git diff --name-only "$($rec.source_sha)..HEAD" 2>$null)
+            $src = @($diff | Where-Object { $_ -notmatch '^(\.gitea|\.atelier|docs)/' -and $_ -notmatch '\.md$' })
+            $kernelChanged = ($env:KERNEL_VERSION -and $rec.kernel -ne $env:KERNEL_VERSION)
+            if ($src.Count -gt 0) { $reason = "source changed: $($src.Count) file(s)" }
+            elseif ($kernelChanged) { $reason = "kernel changed -> $env:KERNEL_VERSION" }
+            else { $build = $false; $reason = 'no source change' }
+          }
+          "build=$build" >> $env:GITHUB_OUTPUT
+          "decide: build=$build ($reason)"
+
+      - name: Resolve versions
+        if: steps.decide.outputs.build == 'true'
+        shell: pwsh
+        run: |
+          git config --global --add safe.directory '*' 2>$null
+          $kv = $env:KERNEL_VERSION; $sv = $env:SDK_VERSION
+          if (-not $kv -or -not $sv) {
+            if (Test-Path '.atelier/versions.json') {
+              $m = Get-Content '.atelier/versions.json' -Raw | ConvertFrom-Json
+              if (-not $kv) { $kv = $m.kernel }
+              if (-not $sv) { $sv = $m.sdk }
+            }
+          }
+          if (-not $kv) { throw 'cannot resolve kernel version' }
+          if (-not $sv) { $sv = $kv }
+          "KERNEL_VERSION=$kv" >> $env:GITHUB_ENV
+          "SDK_VERSION=$sv" >> $env:GITHUB_ENV
+          $rec = $null
+          if (Test-Path '.atelier/version.json') { $rec = Get-Content '.atelier/version.json' -Raw | ConvertFrom-Json }
+          if ($rec -and $rec.version -and $rec.source_sha -eq $env:SOURCE_SHA) { $dv = $rec.version }
+          else {
+            $prev = if ($rec -and $rec.version) { $rec.version } else { '0.0.0' }
+            $p = $prev.Split('.'); $dv = "$($p[0]).$($p[1]).$([int]$p[2] + 1)"
+          }
+          "DOMAIN_VERSION=$dv" >> $env:GITHUB_ENV
+          "ARTIFACT_RELEASE=v$dv" >> $env:GITHUB_ENV
+          "RELEASE_TAG=v$dv" >> $env:GITHUB_ENV
+          "versions: kernel=$kv sdk=$sv domain=$dv"
+
+      - name: Pin versions
+        if: steps.decide.outputs.build == 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force '.atelier' | Out-Null
+          $body = [ordered]@{ schema = 1; kernel = $env:KERNEL_VERSION; sdk = $env:SDK_VERSION; updated = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } | ConvertTo-Json
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) '.atelier/versions.json'), $body, (New-Object System.Text.UTF8Encoding($false)))
+          git config user.name 'Atelier Release'; git config user.email 'release@atelier.local'
+          git add .atelier/versions.json
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -q -m "chore(version): kernel $env:KERNEL_VERSION / sdk $env:SDK_VERSION [skip ci]"
+            $branch = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { 'master' }
+            git push origin "HEAD:refs/heads/$branch" 2>$null
+          }
+
+      - name: Check existing artifact
+        id: existing
+        if: steps.decide.outputs.build == 'true'
+        shell: pwsh
+        run: |
+          $asset = "$env:ASSET_PREFIX-v$env:DOMAIN_VERSION-k$env:KERNEL_VERSION-s$env:SDK_VERSION-$env:SOURCE_SHA.zip"
+          "asset=$asset" >> $env:GITHUB_OUTPUT
+          "assets: $(Gitea-ReleaseAssetNames -Tag $env:RELEASE_TAG -Repo $env:GITHUB_REPOSITORY)"
+
+      - name: Download SDK
+        if: steps.decide.outputs.build == 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force repo\sdk | Out-Null
+          $token = $env:GITEA_TOKEN
+          $url = "$env:GITEA_URL/Atelier/core-kernel/raw/master/ci/gitea-release.ps1"
+          Invoke-WebRequest -Uri $url -Headers @{ Authorization = "token $token" } -OutFile gitea-release.ps1 -TimeoutSec 60
+          . .\gitea-release.ps1 -Repo $env:GITHUB_REPOSITORY
+          $wheel = "atelier_sdk-$env:SDK_VERSION-py3-none-any.whl"
+          $null = Gitea-DownloadAsset -Repo 'core-kernel' -Tag "v$env:SDK_VERSION" -Name $wheel -OutDir repo\sdk
+          "sdk downloaded"
+
+      - name: Create build environment
+        if: steps.decide.outputs.build == 'true'
+        shell: pwsh
+        run: |
+          $env:PIP_CACHE_DIR = Join-Path $env:LOCALAPPDATA 'pip-cache'
+          & 'F:\Atelier\_ci\_toolcache\Python\3.11.9\x64\python.exe' -m venv repo\.venv
+          repo\.venv\Scripts\python.exe -m pip install --no-compile --upgrade pip
+          repo\.venv\Scripts\python.exe -m pip install --no-compile (Get-ChildItem repo\sdk\atelier_sdk-*.whl).FullName
+          if (Test-Path repo\packaging\requirements-windows.txt) {
+            repo\.venv\Scripts\python.exe -m pip install --no-compile -r repo\packaging\requirements-windows.txt
+          }
+          repo\.venv\Scripts\python.exe -m pip install --no-compile nuitka ordered-set zstandard cython setuptools uv
+
+      - name: Build domain
+        if: steps.decide.outputs.build == 'true'
+        shell: pwsh
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\repo\packaging\build.ps1 -Domain $env:DOMAIN -OutDir stage -RepoRoot (Resolve-Path .\repo).Path
+          if ($LASTEXITCODE -ne 0) { throw "build failed for $env:DOMAIN" }
+
+      - name: Extra build step
+        if: steps.decide.outputs.build == 'true' && inputs.extra_build_step != ''
+        shell: pwsh
+        run: |
+          $script = "${{ inputs.extra_build_step }}"
+          Invoke-Expression $script
+
+      - name: Create artifact metadata
+        if: steps.decide.outputs.build == 'true'
+        shell: pwsh
+        run: |
+          $payload = 'stage/payload'
+          New-Item -ItemType Directory -Force $payload | Out-Null
+          $hostDir = "atelier-$env:DOMAIN-host"
+          Get-ChildItem stage -Directory | Where-Object { $_.Name -ne 'payload' } | ForEach-Object {
+            New-Item -ItemType Junction -Path (Join-Path $payload $_.Name) -Target $_.FullName | Out-Null
+          }
+          $meta = [ordered]@{
+            schema = 1
+            version = $env:DOMAIN_VERSION
+            domain = $env:DOMAIN
+            source_sha = $env:SOURCE_SHA
+            kernel_version = $env:KERNEL_VERSION
+            sdk_version = $env:SDK_VERSION
+            python_version = $env:PYTHON_VERSION
+            platform = 'win-x64'
+            payload = 'payload'
+            built_at = (Get-Date).ToUniversalTime().ToString('o')
+          }
+          $meta | ConvertTo-Json -Depth 5 | Set-Content stage/artifact.json -Encoding UTF8
+          $asset = "${{ steps.existing.outputs.asset }}"
+          & tar.exe -a --options zip:compression-level=1 -cf $asset -C stage artifact.json payload 2>$null
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $asset)) { Compress-Archive -Path stage/artifact.json, $payload -DestinationPath $asset -Force }
+          $hash = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+          $hash | Set-Content "$asset.sha256" -Encoding ASCII
+          "built $asset"
+
+      - name: Publish artifact
+        if: steps.decide.outputs.build == 'true'
+        shell: pwsh
+        run: |
+          . .\gitea-release.ps1 -Repo $env:GITHUB_REPOSITORY
+          $asset = "${{ steps.existing.outputs.asset }}"
+          $null = Gitea-EnsureRelease -Tag $env:RELEASE_TAG -Title "Atelier $env:DOMAIN $env:RELEASE_TAG" -Notes "Domain build $env:DOMAIN_VERSION (kernel $env:KERNEL_VERSION, sdk $env:SDK_VERSION)"
+          $null = Gitea-UploadAsset -Tag $env:RELEASE_TAG -Path $asset -Clobber
+          $null = Gitea-UploadAsset -Tag $env:RELEASE_TAG -Path "$asset.sha256" -Clobber
+          "published: $asset"
+
+      - name: Record version
+        if: steps.decide.outputs.build == 'true'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force '.atelier' | Out-Null
+          $rec = [ordered]@{ version = $env:DOMAIN_VERSION; source_sha = $env:SOURCE_SHA; kernel = $env:KERNEL_VERSION; sdk = $env:SDK_VERSION; updated = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) '.atelier/version.json'), ($rec | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
+          git config user.name 'Atelier Release'; git config user.email 'release@atelier.local'
+          git add .atelier/version.json
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -q -m "chore(version): domain $env:DOMAIN_VERSION [skip ci]"
+            $branch = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { 'master' }
+            git push origin "HEAD:refs/heads/$branch" 2>$null
+          }
+          $tagBody = @{ tag_name = $env:RELEASE_TAG; target = $env:SOURCE_SHA; message = "domain $env:DOMAIN_VERSION" } | ConvertTo-Json -Compress
+          try { Invoke-RestMethod -Uri "$env:GITEA_URL/api/v1/repos/$($env:GITHUB_REPOSITORY)/tags" -Method Post -Headers @{ Authorization = "token $($env:GITEA_TOKEN)" } -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($tagBody)) -TimeoutSec 30 | Out-Null } catch { }
+
+      - name: Notify collector
+        if: steps.decide.outputs.build == 'true'
+        shell: pwsh
+        run: |
+          $body = [ordered]@{
+            ref = 'master'
+            inputs = [ordered]@{
+              domain         = $env:DOMAIN
+              kernel_version = $env:KERNEL_VERSION
+              sdk_version    = $env:SDK_VERSION
+              source_sha     = $env:SOURCE_SHA
+              asset          = "${{ steps.existing.outputs.asset }}"
+              release        = $env:RELEASE_TAG
+            }
+          } | ConvertTo-Json -Compress
+          $url = "$env:GITEA_URL/api/v1/repos/Atelier/dist-paid/actions/workflows/collect.yml/dispatches"
+          try {
+            Invoke-RestMethod -Uri $url -Method Post -Headers @{ Authorization = "token $($env:GITEA_TOKEN)" } `
+              -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 30 | Out-Null
+            "notified collector"
+          } catch { "notify failed: HTTP $($_.Exception.Response.StatusCode.value__)" }
