@@ -4,7 +4,7 @@
 本模块只负责协议与能力，不关心 Windows 命名管道 / Unix domain socket 的差异。
 """
 
-__version__ = "0.5.7"
+__version__ = "0.0.1"
 
 import asyncio
 import io
