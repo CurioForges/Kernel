@@ -1,24 +1,25 @@
 name: Kernel release
 
-# 内核发版：编译 runtime + 双 SDK → 发 Gitea release → 按 topic 通用通知所有域仓库。
-# 域仓库列表不写死：查询 topic=atelier-domain 的所有仓库，没有 artifact.yml 的自动跳过。
+# master 有提交就自动发版：自动 patch 递增 → 构建 → 打 tag → 发 release → 按 topic 通知全部域仓库。
+# 开发在开发分支做，合并到 master 即代表"这一批要发布"。
 
 on:
   push:
-    tags: ["v*"]
+    branches: [master]
   workflow_dispatch:
     inputs:
-      version:
-        description: 版本号（如 0.5.3）；留空则取 Cargo.toml 的 version
-        required: false
-        default: ""
-      publish:
-        description: 真正发布到 Gitea release（关闭时只构建、不发布、不通知）
-        type: boolean
-        default: false
+      bump:
+        description: 版本递增类型
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
 
 jobs:
-  build:
+  release:
     runs-on: windows-x64
     timeout-minutes: 60
     env:
@@ -29,32 +30,46 @@ jobs:
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.ATELIER_PAT }}
-          fetch-depth: 1
+          fetch-depth: 0
 
-      - name: Resolve version and toolchain
+      - name: Resolve next version and notes
         id: ver
         shell: pwsh
         run: |
-          $v = "${{ inputs.version }}"
-          if (-not $v) {
-            $line = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
-            $v = $line.Matches[0].Groups[1].Value
+          $ErrorActionPreference = 'Stop'
+          $bump = if ('${{ inputs.bump }}') { '${{ inputs.bump }}' } else { 'patch' }
+          $tags = @(git tag --list 'v*' --sort=-v:refname)
+          $latest = if ($tags.Count -gt 0) { $tags[0] } else { 'v0.0.0' }
+          $core = $latest.TrimStart('v')
+          $parts = $core.Split('.')
+          $major = [int]$parts[0]; $minor = [int]$parts[1]; $patchN = [int]$parts[2]
+          switch ($bump) {
+            'major' { $major++; $minor = 0; $patchN = 0 }
+            'minor' { $minor++; $patchN = 0 }
+            default { $patchN++ }
           }
-          "version=$v" >> $env:GITHUB_OUTPUT
-          "KERNEL_VERSION=$v" >> $env:GITHUB_ENV
-          . .\ci\gitea-release.ps1 -Repo 'core-kernel'
-          "cargo : $((& cargo --version) 2>&1)"
-          "node  : $((& node --version) 2>&1)"
-          "python: $((& python --version) 2>&1)"
-          "version = $v"
+          $next = "v$major.$minor.$patchN"
+          "prev=$latest"      >> $env:GITHUB_OUTPUT
+          "tag=$next"         >> $env:GITHUB_OUTPUT
+          "version=$major.$minor.$patchN" >> $env:GITHUB_ENV
+          "TAG=$next"         >> $env:GITHUB_ENV
+          $sha = (git rev-parse HEAD).Trim()
+          "sha=$sha"          >> $env:GITHUB_OUTPUT
+          $subject = (git log -1 --pretty=%s).Trim()
+          $body = (git log -1 --pretty=%b).Trim()
+          $changes = if ($tags.Count -gt 0) { (git log --pretty='- %s (%h)' "$latest..HEAD").Trim() } else { '' }
+          $notes = @($subject, '', $body, '', '### Changes since ' + $latest, $changes) -join "`n"
+          $notes = $notes.Trim()
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) 'release-notes.md'), $notes, (New-Object System.Text.UTF8Encoding($false)))
+          "release: $latest -> $next  (bump=$bump)"
+          "subject: $subject"
 
       - name: Build kernel binary
         shell: pwsh
         run: |
           cargo build --release
-          $bin = 'target\release\atelier-kernel.exe'
-          if (-not (Test-Path $bin)) { throw "kernel binary missing: $bin" }
-          "built: $([math]::Round((Get-Item $bin).Length/1MB,1)) MB"
+          if (-not (Test-Path 'target\release\atelier-kernel.exe')) { throw "kernel binary missing" }
+          "built $([math]::Round((Get-Item 'target\release\atelier-kernel.exe').Length/1MB,1)) MB"
 
       - name: Build SDK packages
         shell: pwsh
@@ -65,7 +80,7 @@ jobs:
           Push-Location sdk\nodejs
           try { & npm pack --pack-destination ..\..\dist\sdk } finally { Pop-Location }
           if ($LASTEXITCODE -ne 0) { throw "npm pack failed" }
-          Get-ChildItem dist\sdk | ForEach-Object { "  sdk: $($_.Name)" }
+          Get-ChildItem dist\sdk | ForEach-Object { "  $($_.Name)" }
 
       - name: Assemble runtime bundle
         shell: pwsh
@@ -80,23 +95,28 @@ jobs:
           Copy-Item sdk\python\README.md "$rt\sdk\python\README.md" -Force
           Copy-Item sdk\nodejs\README.md "$rt\sdk\nodejs\README.md" -Force
           Copy-Item dist\sdk\* "$rt\sdk" -Force
-          $zip = "dist\Atelier-Kernel-runtime-$label-v$env:KERNEL_VERSION.zip"
+          $zip = "dist\Atelier-Kernel-runtime-$label-$env:TAG.zip"
           Compress-Archive -Path "$rt\*" -DestinationPath $zip -Force
-          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  $(Split-Path -Leaf $zip)" | Set-Content "$zip.sha256" -Encoding ASCII
+          $h = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$h  $(Split-Path -Leaf $zip)" | Set-Content "$zip.sha256" -Encoding ASCII
           Get-ChildItem dist\sdk\*.whl | ForEach-Object {
-            $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-            "$h  $($_.Name)" | Set-Content "$($_.FullName).sha256" -Encoding ASCII
+            $hh = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hh  $($_.Name)" | Set-Content "$($_.FullName).sha256" -Encoding ASCII
           }
-          "runtime zip: $([math]::Round((Get-Item $zip).Length/1MB,1)) MB"
+          "runtime: $([math]::Round((Get-Item $zip).Length/1MB,1)) MB"
 
-      - name: Publish release
-        if: ${{ inputs.publish || startsWith(github.ref, 'refs/tags/v') }}
+      - name: Create tag and release
         shell: pwsh
         run: |
-          . .\ci\gitea-release.ps1 -Repo 'core-kernel'
-          $tag = "v$env:KERNEL_VERSION"
-          $null = Gitea-EnsureRelease -Tag $tag -Title "Atelier Kernel $tag" -Notes "Kernel runtime and SDK packages for $tag"
+          $headers = @{ Authorization = "token $($env:GITEA_TOKEN)" }
+          $api = "$env:GITEA_URL/api/v1/repos/Atelier/core-kernel"
+          $tagBody = @{ tag_name = $env:TAG; target = "${{ steps.ver.outputs.sha }}"; message = "release $env:TAG" } | ConvertTo-Json -Compress
+          try { Invoke-RestMethod -Uri "$api/tags" -Method Post -Headers $headers -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($tagBody)) -TimeoutSec 60 | Out-Null; "tag $env:TAG created" }
+          catch { "tag exists or failed: $($_.Exception.Message)" }
+          $notes = Get-Content release-notes.md -Raw
+          $relBody = @{ tag_name = $env:TAG; name = "Atelier Kernel $env:TAG"; body = $notes; draft = $false; prerelease = $false } | ConvertTo-Json -Compress
+          $rel = Invoke-RestMethod -Uri "$api/releases" -Method Post -Headers $headers -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($relBody)) -TimeoutSec 60
+          "release id=$($rel.id) tag=$($rel.tag_name)"
           $assets = @()
           $assets += Get-ChildItem dist\Atelier-Kernel-runtime-*.zip | Select-Object -ExpandProperty FullName
           $assets += Get-ChildItem dist\Atelier-Kernel-runtime-*.zip.sha256 | Select-Object -ExpandProperty FullName
@@ -104,34 +124,29 @@ jobs:
           $assets += Get-ChildItem dist\sdk\*.whl.sha256 | Select-Object -ExpandProperty FullName
           $assets += Get-ChildItem dist\sdk\*.tgz | Select-Object -ExpandProperty FullName
           foreach ($a in $assets) {
-            $null = Gitea-UploadAsset -Tag $tag -Path $a -Clobber
-            "  ↑ $(Split-Path -Leaf $a)"
+            $name = Split-Path -Leaf $a
+            $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $a).Path)
+            $boundary = [guid]::NewGuid().ToString()
+            $head = "--$boundary`r`nContent-Disposition: form-data; name=`"attachment`"; filename=`"$name`"`r`nContent-Type: application/octet-stream`r`n`r`n"
+            $tail = "`r`n--$boundary--`r`n"
+            $ms = New-Object System.IO.MemoryStream
+            $hb = [Text.Encoding]::UTF8.GetBytes($head); $tb = [Text.Encoding]::UTF8.GetBytes($tail)
+            $ms.Write($hb,0,$hb.Length); $ms.Write($bytes,0,$bytes.Length); $ms.Write($tb,0,$tb.Length)
+            Invoke-RestMethod -Uri "$api/releases/$($rel.id)/assets?name=$name" -Method Post -Headers $headers -ContentType "multipart/form-data; boundary=$boundary" -Body $ms.ToArray() -TimeoutSec 900 | Out-Null
+            "  ↑ $name"
           }
-          "assets: " + ((Gitea-ReleaseAssetNames -Tag $tag) -join ', ')
 
       - name: Notify all domain repos
-        if: ${{ inputs.publish || startsWith(github.ref, 'refs/tags/v') }}
         shell: pwsh
         run: |
-          # 通用规则：按 topic 找域仓库，不写死任何仓库名。
-          # 没有 artifact.yml 的仓库会被跳过，不影响其他仓库。
-          $token = $env:GITEA_TOKEN
-          $headers = @{ Authorization = "token $token" }
+          $headers = @{ Authorization = "token $($env:GITEA_TOKEN)" }
           $found = Invoke-RestMethod -Uri "$env:GITEA_URL/api/v1/repos/search?q=atelier-domain&topic=true&limit=50" -Headers $headers -TimeoutSec 30
-          $dispatched = 0; $skipped = 0
+          $ok = 0; $skip = 0
           foreach ($repo in $found.data) {
-            $body = @{
-              ref = 'master'
-              inputs = @{ kernel_version = $env:KERNEL_VERSION; sdk_version = $env:KERNEL_VERSION }
-            } | ConvertTo-Json -Compress
-            $url = "$env:GITEA_URL/api/v1/repos/$($repo.full_name)/actions/workflows/artifact.yml/dispatches"
+            $body = @{ ref = 'master'; inputs = @{ kernel_version = $env:version; sdk_version = $env:version } } | ConvertTo-Json -Compress
             try {
-              Invoke-RestMethod -Uri $url -Method Post -Headers $headers -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 30 | Out-Null
-              "  dispatched $($repo.name)"
-              $dispatched++
-            } catch {
-              "  skip $($repo.name) (无 artifact.yml 或权限不足)"
-              $skipped++
-            }
+              Invoke-RestMethod -Uri "$env:GITEA_URL/api/v1/repos/$($repo.full_name)/actions/workflows/artifact.yml/dispatches" -Method Post -Headers $headers -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 30 | Out-Null
+              "  dispatched $($repo.name)"; $ok++
+            } catch { "  skip $($repo.name)"; $skip++ }
           }
-          "domain repos: dispatched=$dispatched skipped=$skipped"
+          "domains: dispatched=$ok skipped=$skip"
