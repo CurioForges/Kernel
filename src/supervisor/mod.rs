@@ -109,21 +109,54 @@ fn accept_reader(
 }
 
 fn pump_lines<R: std::io::Read>(
+    input: R,
+    stop: &AtomicBool,
+    drain: Option<&AtomicBool>,
+    line: impl FnMut(&str),
+) -> std::io::Result<()> {
+    pump_lines_impl(input, stop, drain, false, line)
+}
+
+/// 日志管道专用：非法 UTF-8 不报错，用替换字符解码后照常上报。
+///
+/// 域进程的 stdout/stderr 是**日志**，不是协议。一行里混进一个 GBK 字节就整行丢弃，
+/// 会让"为什么失败"永远看不到——实测就吃过这个亏（异常行被吞，只剩 traceback 帧）。
+/// IPC 那条通道仍然严格（见 `pump_lines`），协议帧坏了必须立刻失败。
+fn pump_lines_lossy<R: std::io::Read>(
+    input: R,
+    stop: &AtomicBool,
+    drain: Option<&AtomicBool>,
+    line: impl FnMut(&str),
+) -> std::io::Result<()> {
+    pump_lines_impl(input, stop, drain, true, line)
+}
+
+fn pump_lines_impl<R: std::io::Read>(
     mut input: R,
     stop: &AtomicBool,
     drain: Option<&AtomicBool>,
+    lossy: bool,
     mut line: impl FnMut(&str),
 ) -> std::io::Result<()> {
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 8192];
     let mut drained = 0usize;
+    // 解析一行：严格模式下非法字节直接报错，日志模式下替换后继续。
+    let decode = |raw: &[u8]| -> std::io::Result<String> {
+        if lossy {
+            Ok(String::from_utf8_lossy(raw).into_owned())
+        } else {
+            std::str::from_utf8(raw)
+                .map(str::to_owned)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        }
+    };
     while !stop.load(Ordering::Acquire) {
         match input.read(&mut chunk) {
             Ok(0) => {
                 if !bytes.is_empty() {
-                    let text = std::str::from_utf8(&bytes)
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                    line(text);
+                    let text = decode(&bytes)?;
+                    line(&text);
                 }
                 return Ok(());
             }
@@ -143,9 +176,8 @@ fn pump_lines<R: std::io::Read>(
                     }
                     bytes.extend_from_slice(part);
                     if bytes.last() == Some(&b'\n') {
-                        let text = std::str::from_utf8(&bytes)
-                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                        line(text);
+                        let text = decode(&bytes)?;
+                        line(&text);
                         bytes.clear();
                     }
                 }
@@ -431,6 +463,11 @@ impl DomainSupervisorInner {
                 .env_remove("ATELIER_IPC_PIPE")
                 .env("ATELIER_IPC_IN", &in_path)
                 .env("ATELIER_IPC_OUT", &out_path)
+                // 域进程的 stdout/stderr 在这里被重定向成管道。Windows 上 Python
+                // 重定向时会退回 ANSI（GBK），中文日志就成了非法 UTF-8——以前直接
+                // 丢掉整行（`invalid utf-8 sequence`），异常原因凭空消失。
+                // 强制子进程日志走 UTF-8；真机没设过这个变量的域不受影响（默认行为不变）。
+                .env("PYTHONIOENCODING", "utf-8")
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -677,7 +714,7 @@ impl DomainSupervisorInner {
                         thread::Builder::new()
                             .name(format!("kernel-{label}-{id}-{generation}"))
                             .spawn(move || {
-                                let result = pump_lines(input, &stop, None, |text| {
+                                let result = pump_lines_lossy(input, &stop, None, |text| {
                                     if let Some(router) = weak.upgrade() {
                                         router.logger().reinject(LogRecord {
                                             source_domain: Some(domain.clone()),
@@ -1421,6 +1458,39 @@ mod bounded_transport_drain_test {
         assert_eq!(lines, ["received", "started", "completed"]);
         // The writer is intentionally still alive: no timeout or EOF was needed to finish.
         drop(inherited_writer);
+    }
+}
+
+/// 日志解码与 IPC 解码的分界：日志必须容错，协议必须严格。
+/// 独立模块、不带 cfg(unix)——这条行为在 Windows 上同样要守。
+#[cfg(test)]
+mod log_decode_tests {
+    use super::*;
+
+    #[test]
+    fn log_pump_keeps_lines_with_invalid_utf8_but_ipc_pump_rejects_them() {
+        use std::io::Write;
+
+        // GBK 的“错误”两字（0xB4 0xED 0xCE 0xF3）不是合法 UTF-8
+        let (input, mut writer) = std::io::pipe().unwrap();
+        writer.write_all(b"before\n\xb4\xed\xce\xf3 boom\nafter\n").unwrap();
+        drop(writer);
+        let mut lines = Vec::new();
+        let result = pump_lines_lossy(input, &AtomicBool::new(false), None, |line| {
+            lines.push(line.trim_end().to_owned())
+        });
+        assert!(result.is_ok(), "lossy log pump must not fail: {result:?}");
+        assert_eq!(lines.len(), 3, "all three lines must survive: {lines:?}");
+        assert_eq!(lines[0], "before");
+        assert!(lines[1].ends_with("boom"), "{}", lines[1]);
+        assert_eq!(lines[2], "after");
+
+        // 同样的字节走 IPC 通道必须报错：协议帧坏了不能静默
+        let (input, mut writer) = std::io::pipe().unwrap();
+        writer.write_all(b"\xb4\xed\xce\xf3\n").unwrap();
+        drop(writer);
+        let strict = pump_lines(input, &AtomicBool::new(false), None, |_| {});
+        assert!(strict.is_err(), "strict IPC pump must reject invalid utf-8");
     }
 }
 
