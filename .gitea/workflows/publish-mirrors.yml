@@ -1,0 +1,105 @@
+name: Publish release to mirrors
+
+# 本仓的 release 资产要出现在镜像仓里，且不依赖 dist-free 那条中心链路。
+# 触发：release 发布 / 手动 / 每 6 小时对账（上传是幂等覆盖，重复跑无副作用）。
+# 只读 Gitea API + 写镜像；不构建、不改代码。
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
+
+jobs:
+  publish:
+    runs-on: windows-x64
+    timeout-minutes: 60
+    env:
+      GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITEA_URL: https://atelier.hurcaguari.top
+      CNB_TOKEN: ${{ secrets.ATELIER_CNB_TOKEN }}
+      CNB_API: https://api.cnb.cool
+      CNB_REPO: Atelier-2026/Kernel
+      GITLAB_TOKEN: ${{ secrets.ATELIER_GITLAB_TOKEN }}
+      GITLAB_PROJECT: "88933579"
+      GITLAB_PACKAGE: "atelier-kernel"
+    steps:
+      - name: Resolve latest release
+        id: rel
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $h = @{ Authorization = "token $($env:GITEA_TOKEN)" }
+          $rel = Invoke-RestMethod -Uri "$env:GITEA_URL/api/v1/repos/$env:GITHUB_REPOSITORY/releases?limit=1" -Headers $h -TimeoutSec 60
+          if (-not $rel -or -not $rel[0]) { throw "本仓没有 release，先发一个再跑" }
+          $tag = $rel[0].tag_name
+          $assets = @($rel[0].assets)
+          $ver = $tag.TrimStart('v')
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$ver" >> $env:GITHUB_OUTPUT
+          "release $tag: $($assets.Count) 个资产"
+
+          $dir = Join-Path $env:RUNNER_TEMP 'rel'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          $list = @()
+          foreach ($a in $assets) {
+            if ($a.name -like '*.sha256') { continue }
+            $local = Join-Path $dir $a.name
+            Invoke-WebRequest -Uri $a.browser_download_url -Headers $h -OutFile $local -TimeoutSec 1800
+            $list += [pscustomobject]@{ name = $a.name; path = $local; size = (Get-Item $local).Length }
+          }
+          $list | ConvertTo-Json -Compress | Set-Content (Join-Path $dir 'assets.json') -Encoding UTF8
+          "dir=$dir" >> $env:GITHUB_OUTPUT
+
+      - name: Mirror to CNB
+        if: env.CNB_REPO != ''
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:CNB_TOKEN) { "no cnb token, skip"; exit 0 }
+          $auth = @{ Authorization = "Bearer $($env:CNB_TOKEN)"; Accept = 'application/vnd.cnb.api+json' }
+          $tag = "${{ steps.rel.outputs.tag }}"
+          $list = Get-Content (Join-Path "${{ steps.rel.outputs.dir }}" 'assets.json') -Raw | ConvertFrom-Json
+
+          $rels = Invoke-RestMethod -Uri "$env:CNB_API/$($env:CNB_REPO)/-/releases" -Headers $auth -TimeoutSec 60
+          $hit = @($rels) | Where-Object { $_.tag_name -eq $tag } | Select-Object -First 1
+          if ($hit) { $relId = $hit.id; "cnb release exists: $relId" }
+          else {
+            $b = @{ tag_name = $tag; name = "$($env:GITHUB_REPOSITORY.Split('/')[-1]) $tag"; description = 'mirror of the Gitea release'; draft = $false; prerelease = $false; target_commitish = 'master' } | ConvertTo-Json -Compress
+            $relId = (Invoke-RestMethod -Uri "$env:CNB_API/$($env:CNB_REPO)/-/releases" -Method Post -Headers $auth -ContentType 'application/json' -Body ([Text.Encoding]::UTF8.GetBytes($b)) -TimeoutSec 60).id
+            "cnb release created: $relId"
+          }
+
+          $fail = @(); $ok = 0
+          foreach ($a in $list) {
+            try {
+              $body = @{ asset_name = $a.name; size = $a.size; overwrite = $true; ttl = 0 } | ConvertTo-Json -Compress
+              $u = Invoke-RestMethod -Uri "$env:CNB_API/$($env:CNB_REPO)/-/releases/$relId/asset-upload-url" -Method Post -Headers $auth -ContentType 'application/json' -Body ([Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 60
+              $put = Invoke-WebRequest -Uri $u.upload_url -Method Put -InFile $a.path -TimeoutSec 1800 -UseBasicParsing
+              if ($put.StatusCode -lt 200 -or $put.StatusCode -ge 300) { throw "upload HTTP $($put.StatusCode)" }
+              if ($u.verify_url) { try { Invoke-RestMethod -Uri $u.verify_url -Method Post -Headers $auth -TimeoutSec 60 | Out-Null } catch { } }
+              "  [ok] $($a.name)"
+              $ok++
+            } catch { $fail += "$($a.name): $($_.Exception.Message)" }
+          }
+          if ($fail.Count) { $fail | ForEach-Object { Write-Host "::error::cnb $_" }; exit 1 }
+          "cnb: pushed $ok asset(s) to $env:CNB_REPO"
+
+      - name: Mirror to GitLab
+        if: env.GITLAB_PROJECT != ''
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:GITLAB_TOKEN) { "no gitlab token, skip"; exit 0 }
+          $ver = "${{ steps.rel.outputs.version }}"
+          $list = Get-Content (Join-Path "${{ steps.rel.outputs.dir }}" 'assets.json') -Raw | ConvertFrom-Json
+          $hdr = @{ 'PRIVATE-TOKEN' = $env:GITLAB_TOKEN }
+          $fail = @(); $ok = 0
+          foreach ($a in $list) {
+            $url = "https://gitlab.com/api/v4/projects/$($env:GITLAB_PROJECT)/packages/generic/$($env:GITLAB_PACKAGE)/$ver/$([uri]::EscapeDataString($a.name))"
+            $out = & curl.exe -sS --fail-with-body --max-time 1800 -X PUT -H "PRIVATE-TOKEN: $($env:GITLAB_TOKEN)" --upload-file $a.path $url 2>&1
+            if ($LASTEXITCODE -ne 0) { $fail += "$($a.name): $out" } else { "  [ok] $($a.name)"; $ok++ }
+          }
+          if ($fail.Count) { $fail | ForEach-Object { Write-Host "::error::gitlab $_" }; exit 1 }
+          "gitlab: pushed $ok asset(s) to $env:GITLAB_PROJECT/$env:GITLAB_PACKAGE/$ver"
