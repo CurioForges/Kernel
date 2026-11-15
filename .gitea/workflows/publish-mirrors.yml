@@ -62,8 +62,9 @@ jobs:
           $tag = "${{ steps.rel.outputs.tag }}"
           $list = Get-Content (Join-Path "${{ steps.rel.outputs.dir }}" 'assets.json') -Raw | ConvertFrom-Json
 
-          $rels = @(Invoke-RestMethod -Uri "$env:CNB_API/$($env:CNB_REPO)/-/releases" -Headers $auth -TimeoutSec 60)
-          $hit = $rels | Where-Object { $_.tag_name -eq $tag } | Select-Object -First 1
+          $rels = @(); foreach ($x in (Invoke-RestMethod -Uri "$env:CNB_API/$($env:CNB_REPO)/-/releases" -Headers $auth -TimeoutSec 60)) { $rels += $x }
+          $hit = @($rels | Where-Object { $_.tag_name -eq $tag }) | Select-Object -First 1
+          if (@($hit).Count -gt 1) { throw "CNB 上同 tag 有多条 release: $(@($hit).Count) 条，先清理再跑" }
           if ($hit) { $relId = $hit.id; "cnb release exists: $relId" }
           else {
             $repoName = $env:GITHUB_REPOSITORY.Split('/')[-1]
