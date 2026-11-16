@@ -176,14 +176,41 @@ jobs:
       - name: Notify all domain repos
         shell: pwsh
         run: |
+          # 域仓已不再自带 workflow 文件（构建由组织级作用域工作流 domain-build.yml 认领），
+          # 所以 actions/workflows/*/dispatches 一定 404 —— 触发方式只能靠 push 事件。
+          # 这里按 train 完整性判定：产物名已含 -k<kernel>-s<sdk> 的域跳过，其余域提交一次
+          # .atelier/kernel-train（内容带时间戳，保证产生一个新提交触发作用域工作流）。
+          $ErrorActionPreference = 'Continue'
           $headers = @{ Authorization = "token $($env:GITEA_TOKEN)" }
+          $kv = $env:version
+          $stamp = "-k$kv-s$kv-"
           $found = Invoke-RestMethod -Uri "$env:GITEA_URL/api/v1/repos/search?q=atelier-domain&topic=true&limit=50" -Headers $headers -TimeoutSec 30
-          $ok = 0; $skip = 0
+          $bumped = 0; $skip = 0; $fail = 0
           foreach ($repo in $found.data) {
-            $body = @{ ref = 'master'; inputs = @{ kernel_version = $env:version; sdk_version = $env:version } } | ConvertTo-Json -Compress
+            $full = $repo.full_name
+            $hasTrain = $false
             try {
-              Invoke-RestMethod -Uri "$env:GITEA_URL/api/v1/repos/$($repo.full_name)/actions/workflows/artifact.yml/dispatches" -Method Post -Headers $headers -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 30 | Out-Null
-              "  dispatched $($repo.name)"; $ok++
-            } catch { "  skip $($repo.name)"; $skip++ }
+              $rels = @(Invoke-RestMethod -Uri "$env:GITEA_URL/api/v1/repos/$full/releases?limit=5" -Headers $headers -TimeoutSec 30)
+              foreach ($rel in $rels) {
+                foreach ($asset in @($rel.assets)) {
+                  if ($asset.name -like "*$stamp*" -and $asset.name.EndsWith('.zip')) { $hasTrain = $true }
+                }
+              }
+            } catch { }
+            if ($hasTrain) { "  skip $($repo.name): already has $stamp"; $skip++; continue }
+
+            $path = '.atelier/kernel-train'
+            $content = "$kv $((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))`n"
+            $sha = $null
+            try {
+              $cur = Invoke-RestMethod -Uri "$env:GITEA_URL/api/v1/repos/$full/contents/$path" -Headers $headers -TimeoutSec 30
+              $sha = $cur.sha
+            } catch { }
+            $body = @{ message = "chore: rebuild for kernel $kv"; content = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($content)); branch = 'master' }
+            if ($sha) { $body.sha = $sha; $method = 'Put' } else { $method = 'Post' }
+            try {
+              Invoke-RestMethod -Uri "$env:GITEA_URL/api/v1/repos/$full/contents/$path" -Method $method -Headers $headers -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes(($body | ConvertTo-Json -Compress))) -TimeoutSec 60 | Out-Null
+              "  bumped $($repo.name) -> $path"; $bumped++
+            } catch { "  FAILED $($repo.name): $($_.Exception.Message)"; $fail++ }
           }
-          "domains: dispatched=$ok skipped=$skip"
+          "domains: bumped=$bumped skipped=$skip failed=$fail (train -k$kv-s$kv-)"
