@@ -23,6 +23,7 @@
 | 文档 | 内容 |
 | :--- | :--- |
 | [transport.md](capabilities/transport.md) | 命名端点传输：`ATELIER_IPC_IN` / `OUT`、平台路径、读写语义、安全边界 |
+| [control-plane.md](capabilities/control-plane.md) | 控制通道：零域启动后运行期 `attach` / `detach` / `update` / `snapshot` 的协议与错误码 |
 | [port-bindings.md](capabilities/port-bindings.md) | 内核托管的域端口绑定：薄转发进程、代际切换、连接排空 |
 | [observation.md](capabilities/observation.md) | 观察能力：调用与执行观察、运行指标、异常事件，以及丢失边界 |
 | [domain-state-observation.md](capabilities/domain-state-observation.md) | 域状态镜像：真实状态写入驱动、初始快照与最新状态合并、无轮询 |

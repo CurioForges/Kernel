@@ -57,7 +57,7 @@ cargo build --release
 # 宪法静态检查 + 账本完整性
 ./target/release/atelier-kernel --check ./my-variant/kernel_boot.json
 
-# 启动（--web-ui 可附带观察台）
+# 启动（无头微内核，不监听 HTTP 端口）
 ./target/release/atelier-kernel --config ./my-variant/kernel_boot.json
 
 # 端到端自检：注册 + 四阶段回执 + 日志入库

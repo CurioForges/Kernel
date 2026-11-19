@@ -65,13 +65,9 @@ cat > "${RUNTIME_OUT}/README.md" <<EOF
    pip install ./sdk/atelier_sdk-${VERSION}-py3-none-any.whl
    npm install ./sdk/atelier-sdk-${VERSION}.tgz
    \`\`\`
-3. Boot your variant (headless by default — no HTTP listener):
+3. Boot your variant (no HTTP listener is started):
    \`\`\`bash
    ./atelier-kernel --config ./my-variant/kernel_boot.json
-   \`\`\`
-   Add the observer UI explicitly (listens on \`web_ui_bind\`, default \`0.0.0.0:8787\`):
-   \`\`\`bash
-   ./atelier-kernel --config ./my-variant/kernel_boot.json --web-ui
    \`\`\`
 EOF
 

@@ -5,7 +5,7 @@ Python Domain (`sensor_hub`) for Atelier Kernel — powered by `atelier_sdk.py`.
 import random
 import time
 from atelier_sdk import AtelierDomain
-domain = AtelierDomain()
+domain = AtelierDomain('sensor_hub')
 auto_traffic_enabled = True
 
 @domain.handler('read')

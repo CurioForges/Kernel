@@ -46,8 +46,11 @@ pub struct KernelBootConfig {
     /// C4 项目根：所有域文件集中到 `<project_root>/<domain>/`；默认 `./data`。
     #[serde(default = "default_project_root")]
     pub project_root: String,
+    /// **已废弃、被忽略**：内核内置的网页观察台（HTTP 控制台）已移除，
+    /// 该字段只为兼容 `deny_unknown_fields` 下的既有配置而保留，不再参与任何监听或解析。
     #[serde(default = "default_web_bind")]
     pub web_ui_bind: String,
+    /// **已废弃、被忽略**：同上，仅用于让既有配置继续解析通过，值不再有任何效果。
     #[serde(default)]
     pub web_ui_enabled: bool,
     #[serde(default)]
@@ -62,11 +65,34 @@ fn default_project_root() -> String {
     "./data".to_string()
 }
 
+/// 已废弃字段 `web_ui_bind` 的默认值；保留只为让缺省该字段的既有配置仍能反序列化。
 fn default_web_bind() -> String {
     "127.0.0.1:8787".to_string()
 }
 
 impl KernelBootConfig {
+    /// 控制通道模式的内存配置：**零引导域**，只承载账本路径与 C4 根。
+    ///
+    /// 内核不再解析域清单，业务域由启动器在运行期逐条 `attach`。
+    /// `source_path` 保持 `None`：没有启动文件，无 spec 更新时直接落回内存规格。
+    ///
+    /// 注意：即使 `domains` 为空，也必须拿这份配置调 `boot_from_config`
+    /// —— 它是 `files_root` 的唯一写入点，而 `files_root` 决定 `ATELIER_FILES_ROOT`
+    /// 的注入（见 `supervisor/mod.rs` 的 `boot_from_config`）。
+    pub fn for_control_host(
+        db_path: impl Into<String>,
+        project_root: impl Into<String>,
+    ) -> Self {
+        Self {
+            source_path: None,
+            db_path: db_path.into(),
+            project_root: project_root.into(),
+            web_ui_bind: default_web_bind(),
+            web_ui_enabled: false,
+            domains: Vec::new(),
+        }
+    }
+
     /// Loads `KernelBootConfig` from a JSON file path, enforces M1/M6 explicit configuration rules,
     /// and resolves relative `db_path` and `working_dir` entries relative to the configuration file's parent directory.
     pub fn load_from_file(path: impl AsRef<std::path::Path>) -> Result<Self, SupervisorError> {

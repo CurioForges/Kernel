@@ -48,6 +48,7 @@
 | **对外端口托管** | `src/services/ports.rs` | 独立薄 TCP 转发进程、代际后端切换、连接排空与故障恢复。 |
 | **契约校验与自动路由器** | `src/router.rs` | 维护 `<domain>.<handler>` 路由表、`TargetInvalid` 零盲发拦截、内置 8 大基础设施分发、系统流扇出与原子候选路由交接。 |
 | **域宿主与代际生命周期** | `src/supervisor/mod.rs` | 创建端点并拉起子进程、物理绑定 `domain_id` 身份、代际隔离、崩溃自动恢复，以及候选注册就绪、路由切换与失败回滚。 |
+| **控制通道（运行期装配）** | `src/frontend/control.rs` | 命名管道上的行分隔 JSON 控制平面：`hello` / `attach` / `detach` / `update` / `list` / `snapshot` / `ping`。不属于域、不进账本、不产生回执；让内核能以**零域**启动并在运行期接入业务域。见 [control-plane.md](capabilities/control-plane.md)。 |
 | **机器宪法与契约检查器** | `src/diag/discipline.rs` | 实现机器宪法（M1–M7）静态与启动期执法（`atelier-kernel --check`），校验配置显式性、表结构防漂移、行级损坏与多语言域源码纪律。 |
 
 ---

@@ -63,8 +63,6 @@ atelier-kernel --config ./my-variant/kernel_boot.json --smoke-test
 {
   "db_path": "./data/atelier_kernel.db",   // 默认值
   "project_root": "./data",                // C4 文件根：<project_root>/<domain>/
-  "web_ui_bind": "0.0.0.0:8787",
-  "web_ui_enabled": false,
   "domains": [
     {
       "domain_id": "order",                 // M1：字母数字下划线，全局唯一

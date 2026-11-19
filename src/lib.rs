@@ -42,7 +42,6 @@ pub use supervisor::client::DomainPipeClient;
 pub use supervisor::config::{
     DomainProcessSpec, DomainUpdateResult, KernelBootConfig, SupervisorError,
 };
-pub use frontend::web::WebFrontendDomain;
 
 /// Top-level Atelier Kernel host combining:
 /// 1. Domain Supervisor (OS child process `Stdio` pipe lifecycle & physical identity binding)

@@ -139,8 +139,6 @@ my-product-variant/
 ```json
 {
   "db_path": "./data/atelier_kernel.db",
-  "web_ui_bind": "0.0.0.0:8787",
-  "web_ui_enabled": false,
   "domains": [
     {
       "domain_id": "billing",
@@ -161,15 +159,11 @@ my-product-variant/
 然后启动内核：
 
 ```bash
-# 默认：无头微内核（不监听任何 HTTP 端口，仅托管域、路由、存储与日志）
+# 无头微内核（不监听任何 HTTP 端口，仅托管域、路由、存储与日志）
 ./atelier-kernel --config ./my-product-variant/kernel_boot.json
-
-# 需要实时观察台时再显式开启（监听 web_ui_bind，默认 0.0.0.0:8787）
-./atelier-kernel --config ./my-product-variant/kernel_boot.json --web-ui
-# 也可以把 "web_ui_enabled": true 写进配置，省掉命令行开关
 ```
 
-> **Web UI 默认关闭**。加 `--headless` 可强制关闭，即使配置里写了 `web_ui_enabled: true` 也不生效。
+> 内核内置的网页观察台已移除：`--web-ui` / `--dashboard` 不再有任何作用。既有配置里的 `web_ui_bind` / `web_ui_enabled` 仍会被接受但被忽略（仅为兼容 `deny_unknown_fields`，不要写进新配置）。
 
 ---
 
@@ -178,15 +172,28 @@ my-product-variant/
 | 参数 | 说明 |
 | :--- | :--- |
 | `--config <path>` | 指定变体启动配置文件路径（默认：`./kernel_boot.json`） |
+| `--control-pipe <name>` | **运行期装配模式**：以零域启动，在命名管道上等启动方逐条 `attach` 业务域。给出该参数时 `--config` 被忽略 |
+| `--control-token <token>` | 控制通道握手令牌（在 `hello` 里比对）；省略则不校验 |
+| `--db <path>` | 控制通道模式下的账本路径（**必填**）；相对路径按内核 cwd 解析成绝对路径 |
+| `--root <path>` | 控制通道模式下的 C4 项目根（**必填**）；同上 |
 | `--init <dir>` | 在目标目录一键生成新变体配置模板与示例域脚手架 |
 | `--check <path>` | 机器宪法静态检查（M1–M7）+ 账本行级完整性；退出码非 0 表示有违规 |
 | `--smoke-test` | 端到端自检：等所有域注册、向每个域的首个路由发探针、校验四阶段与 `hub_logs` |
-| `--web-ui` / `--dashboard` | 启动实时观察台（默认关闭） |
-| `--headless` | 强制无头运行，优先级高于配置里的 `web_ui_enabled` |
+| `--web-ui` / `--dashboard` | 已移除：内核不再内置网页观察台，传入这两个参数没有任何效果 |
+| `--headless` | 兼容保留的 no-op：内核已不监听任何 HTTP 端口，所有启动方式都是无头 |
 | `--cli` | 启动终端交互式 REPL 测试前端域 |
 | `--auto` / `-a` | 运行内置 7 项内核契约与幂等自动化自检套件并退出 |
 | `--version` / `-v` | 查看内核版本号 |
 | `--help` / `-h` | 查看命令行帮助 |
+
+### 两种装配方式
+
+| 方式 | 域清单来自 | 适用 |
+| :--- | :--- | :--- |
+| `--config <json>` | 启动文件里的 `domains` 数组，内核启动时一次性拉起 | 变体开发、`--check` / `--smoke-test`、CI |
+| `--control-pipe <name>` | **没有清单**。内核零域启动，启动方在运行期逐条 `attach` | 产品装机：安装树是唯一真相，更新不再重写配置 |
+
+控制通道的协议、错误码与连接语义见 [capabilities/control-plane.md](capabilities/control-plane.md)。
 
 `--port-relay` 是内核托管端口转发时自用的内部子进程模式，不要手工调用。
 

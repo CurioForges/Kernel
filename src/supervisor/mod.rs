@@ -384,6 +384,12 @@ struct DomainSupervisorInner {
     forwarders: Mutex<HashMap<(String, String), (PortBinding, Arc<Forwarder>)>>,
     retiring: Mutex<Vec<RetiringProcess>>,
     boot_config_path: RwLock<Option<std::path::PathBuf>>,
+    /// **文件装配**的域 id（`boot_from_config` 里登记）。
+    ///
+    /// 它决定无 spec 更新的规格来源：文件装配的域必须重读启动文件（宪法要求，
+    /// 文件里删掉该域 = 明确失败并保留旧代际）；运行期动态接入的域不在文件里，
+    /// 只能落回内存规格。没有这个集合就无法区分"被删掉了"和"本来就不在文件里"。
+    boot_domains: RwLock<std::collections::HashSet<String>>,
     /// C4 项目根；spawn 时给域注入 `ATELIER_FILES_ROOT=<root>/<domain>`。
     files_root: RwLock<Option<std::path::PathBuf>>,
     router: Arc<KernelRouter>,
@@ -954,6 +960,7 @@ impl DomainSupervisor {
     pub fn new(router: Arc<KernelRouter>) -> Self {
         let inner = Arc::new(DomainSupervisorInner {
             boot_config_path: RwLock::new(None),
+            boot_domains: RwLock::new(std::collections::HashSet::new()),
             files_root: RwLock::new(None),
             forwarders: Mutex::new(HashMap::new()),
             retiring: Mutex::new(Vec::new()),
@@ -1035,6 +1042,11 @@ impl DomainSupervisor {
     ) -> Vec<(String, Result<u32, SupervisorError>)> {
         *self.inner.boot_config_path.write() = config.source_path.clone();
         *self.inner.files_root.write() = Some(std::path::PathBuf::from(&config.project_root));
+        *self.inner.boot_domains.write() = config
+            .domains
+            .iter()
+            .map(|spec| spec.domain_id.clone())
+            .collect();
         config
             .domains
             .iter()
@@ -1132,6 +1144,30 @@ impl DomainSupervisor {
     pub fn get_pid(&self, id: &str) -> Option<u32> {
         self.inner.control(id).and_then(|c| c.state.lock().pid())
     }
+    /// 从启动文件里取目标域的最新规格。
+    ///
+    /// - 文件装配的域：必须重读启动文件取最新规格（宪法「启动配置与滚动更新」）。
+    ///   文件里**删掉了**这个域属于明确失败，保留旧代际——不能悄悄退回内存规格。
+    /// - 运行期动态接入的域：文件里本来就没有它们，返回 `Ok(None)` 让调用方用内存规格。
+    /// - 没有启动文件（控制通道模式的零域启动）：直接 `Ok(None)`。
+    ///
+    /// 读取/解析失败一律冒泡，避免"文件坏了却静默成功"。
+    fn spec_from_boot_file(
+        &self,
+        id: &str,
+    ) -> Result<Option<DomainProcessSpec>, SupervisorError> {
+        let Some(path) = self.inner.boot_config_path.read().clone() else {
+            return Ok(None);
+        };
+        let from_file = KernelBootConfig::load_from_file(path)?
+            .domains
+            .into_iter()
+            .find(|spec| spec.domain_id == id);
+        if from_file.is_none() && self.inner.boot_domains.read().contains(id) {
+            return Err(SupervisorError::UnknownDomainSpec(id.into()));
+        }
+        Ok(from_file)
+    }
     pub fn update_process_domain(
         &self,
         id: &str,
@@ -1141,20 +1177,15 @@ impl DomainSupervisor {
     ) -> Result<DomainUpdateResult, SupervisorError> {
         let spec = match new_spec {
             Some(spec) => spec,
-            None => {
-                let path = self.inner.boot_config_path.read().clone();
-                if let Some(path) = path {
-                    KernelBootConfig::load_from_file(path)?
-                        .domains
-                        .into_iter()
-                        .find(|spec| spec.domain_id == id)
-                        .ok_or_else(|| SupervisorError::UnknownDomainSpec(id.into()))?
-                } else {
-                    // Embedded hosts without a file retain their explicit in-memory configuration.
-                    self.get_spec(id)
-                        .ok_or_else(|| SupervisorError::UnknownDomainSpec(id.into()))?
-                }
-            }
+            None => match self.spec_from_boot_file(id)? {
+                // 宪法「启动配置与滚动更新」：文件装配的域必须重读启动文件取最新规格。
+                Some(spec) => spec,
+                // 运行期动态接入的域不在启动文件里（内核以空域启动），退回内存里的规格，
+                // 否则「无 spec 更新」对它们必然报 UnknownDomainSpec。
+                None => self
+                    .get_spec(id)
+                    .ok_or_else(|| SupervisorError::UnknownDomainSpec(id.into()))?,
+            },
         };
         if spec.domain_id != id {
             return Err(SupervisorError::UpdateValidationFailed {

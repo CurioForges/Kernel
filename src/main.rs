@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -10,14 +9,12 @@ mod shutdown;
 
 use atelier_kernel::{
     AtelierKernel, ContractStatus, DomainStatus, InteractiveFrontendDomain, KernelBootConfig,
-    KernelToDomainFrame, WebFrontendDomain, check_constitution,
+    KernelToDomainFrame, check_constitution,
 };
 use serde_json::json;
 
 const DEFAULT_TEMPLATE_JSON: &str = r#"{
   "db_path": "./data/atelier_kernel.db",
-  "web_ui_bind": "0.0.0.0:8787",
-  "web_ui_enabled": false,
   "domains": [
     {
       "domain_id": "sample_py",
@@ -254,8 +251,19 @@ fn print_help() {
     println!();
     println!("OPTIONS:");
     println!("  --config <path>   Path to boot configuration JSON (default: ./kernel_boot.json)");
-    println!("  --web-ui, --dashboard  Launch optional browser testing & observation console");
-    println!("  --headless        Run pure microkernel supervisor without Web UI (default)");
+    println!(
+        "  --control-pipe <name>  Listen on a named control pipe and boot with ZERO domains;"
+    );
+    println!(
+        "                    the launcher attaches every business domain at runtime."
+    );
+    println!("                    When given, --config is ignored.");
+    println!("  --control-token <token>  Handshake token compared by the `hello` control op");
+    println!("  --db <path>       Ledger path (required with --control-pipe)");
+    println!("  --root <path>     C4 file root / project root (required with --control-pipe)");
+    println!(
+        "  --headless        Run without any HTTP listener (always the case; kept for CLI compatibility)"
+    );
     println!(
         "  --smoke-test      Boot variant, verify domain registration & 4-stage messaging, and exit"
     );
@@ -267,6 +275,79 @@ fn print_help() {
     println!("  --init <dir>      Initialize a new product variant directory with config template");
     println!("  --version, -v     Print version information");
     println!("  --help, -h        Print this help message");
+}
+
+/// 取 `--flag value` 形式的参数值。
+fn flag_value(args: &[String], name: &str) -> Option<String> {
+    args.windows(2)
+        .find(|window| window[0] == name)
+        .map(|window| window[1].clone())
+}
+
+/// 相对路径一律解析到内核自己的 cwd：控制通道模式下 `--db` / `--root` 由启动器传入，
+/// 写相对路径会随 cwd 漂移，落出一个"看起来正常但读错了账本/文件根"的内核。
+fn absolute_path(path: &str) -> String {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        return path.to_string_lossy().into_owned();
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path).to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string_lossy().into_owned())
+}
+
+/// `--control-pipe` 分支：零引导域启动 + 控制通道监听。
+///
+/// 这是"内核不解析域清单"的那条路：装配责任整体移交给启动器，
+/// 域在运行期通过控制通道逐条 `attach` 进来。
+fn run_control_host(
+    args: &[String],
+    pipe_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(db_path) = flag_value(args, "--db") else {
+        return Err("--control-pipe requires an explicit --db <path>".into());
+    };
+    let Some(project_root) = flag_value(args, "--root") else {
+        return Err("--control-pipe requires an explicit --root <path>".into());
+    };
+    let token = flag_value(args, "--control-token").filter(|token| !token.is_empty());
+
+    let boot_config = KernelBootConfig::for_control_host(
+        absolute_path(&db_path),
+        absolute_path(&project_root),
+    );
+    let kernel = std::sync::Arc::new(AtelierKernel::open_with_db_and_root(
+        &boot_config.db_path,
+        &boot_config.project_root,
+    )?);
+
+    // 空 `domains` 也必须调用：`boot_from_config` 是 `files_root` 的唯一写入点，
+    // 而 `files_root` 决定 `ATELIER_FILES_ROOT` 的注入。少了这一步，
+    // 之后 attach 进来的**每一个**域做 vfs 操作都会直接失败。
+    kernel.supervisor().boot_from_config(&boot_config);
+
+    let channel = atelier_kernel::frontend::control::spawn(&kernel, pipe_name, token)?;
+    println!(
+        "[AtelierKernel] Control plane listening on {} (0 bootstrap domains; db={}, root={})",
+        channel.path(),
+        boot_config.db_path,
+        boot_config.project_root
+    );
+
+    #[cfg(windows)]
+    {
+        let shutdown_event = shutdown::ShutdownEvent::new()?;
+        shutdown_event.wait()?;
+        channel.stop();
+        Ok(()) // Dropping the kernel runs the existing supervisor shutdown and reclamation.
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = &channel;
+        loop {
+            thread::sleep(Duration::from_secs(3600));
+        }
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -303,6 +384,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .find(|w| w[0] == "--config")
         .map(|w| w[1].as_str())
         .unwrap_or("./kernel_boot.json");
+
+    // 控制通道模式：内核不再解析域清单，以**零域**启动，业务域由启动器逐条 attach。
+    // 该分支刻意不读 `--config`（没有引导域），也不参与 `--smoke-test` / `--check`。
+    if let Some(pipe_name) = flag_value(&args, "--control-pipe") {
+        return run_control_host(&args, &pipe_name);
+    }
 
     if let Some(check_pos) = args.iter().position(|a| a == "--check") {
         let check_target = args
@@ -350,16 +437,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let enable_web_ui = (args.iter().any(|a| a == "--web-ui" || a == "--dashboard")
-        || boot_config.web_ui_enabled)
-        && !args.iter().any(|a| a == "--headless");
-
-    if enable_web_ui {
-        let kernel = Arc::new(AtelierKernel::open_with_db_and_root(&boot_config.db_path, &boot_config.project_root)?);
-        let web_domain = Arc::new(WebFrontendDomain::attach_with_config(kernel, &boot_config));
-        web_domain.serve_http(&boot_config.web_ui_bind)?;
-        return Ok(());
-    }
+    // `--headless` is accepted as a no-op: the kernel no longer embeds an HTTP
+    // observation console, so every boot mode is headless by definition.
+    let _headless = args.iter().any(|a| a == "--headless");
 
     // Default: Headless microkernel runtime without HTTP server port overhead
     #[cfg(windows)]
@@ -370,9 +450,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "[AtelierKernel] Microkernel headless runtime active ({} domain(s) supervised from {})",
         spawned.len(),
         config_path
-    );
-    println!(
-        "  Web UI is disabled by default. Pass --web-ui / --dashboard or set \"web_ui_enabled\": true to enable observation console."
     );
     #[cfg(windows)]
     {
