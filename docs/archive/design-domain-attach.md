@@ -211,7 +211,7 @@ UTF-8、一行一个 JSON、`\n` 分隔。请求必须带 `id`（客户端自增
 | 2 | `UpdateDomain` 改"先内存后文件" | 动态域不带 spec 也能更新 |
 | 3 | 移除 web_ui（含兼容字段保留） | `cargo check --all-targets` 通过；老配置仍能解析 |
 | 4 | 启动器切新流程 | 5 域全部 active，工作台正常 |
-| 5 | 拖拽安装 = attach 一条 | **不重启内核**装上新域 |
+| 5 | ~~拖拽安装 = attach 一条~~ | 已取消（2026-11-21）：安装/更新统一由启动器完成，装完整体换入并重启实例，不做窗口级拖放 |
 
 每阶段的验证命令：`cargo test`、`atelier-kernel --check ./kernel_boot.json`、`--smoke-test`（阶段 0-2 期间仍用现有变体配置做回归）。
 
@@ -235,7 +235,7 @@ UTF-8、一行一个 JSON、`\n` 分隔。请求必须带 `id`（客户端自增
 | 5 | 文档：`INDEX.md`、`ARCHITECTURE.md`、`VARIANT_GUIDE.md` 同步；`CONSTITUTION.md` 修订 §139-141 | ✅ 已完成（新增 `capabilities/control-plane.md`） |
 | 6 | 启动器：`variant_runtime::open_workbench` 改新流程；新增控制客户端模块 | ✅ 已完成（`Atelier/src-tauri/src/control.rs` + `open_workbench_blocking`） |
 | 7 | 启动器：域状态改读 `snapshot`；`installed` 改由安装树判断 | ✅ 已完成（`capabilities.rs`） |
-| 8 | 启动器：拖拽安装 → 写清单（`launcher.json` 内）+ attach | 待办（`control::update` 已留好入口） |
+| 8 | 启动器：拖拽安装 → 写清单（`launcher.json` 内）+ attach | 已取消（2026-11-21） |
 
 ### 11.2 启动器侧的实现决定（2026-11-18）
 
@@ -251,7 +251,7 @@ UTF-8、一行一个 JSON、`\n` 分隔。请求必须带 `id`（客户端自增
 ### 11.3 仍未做
 
 - `kernel_boot.json` 现在**只写不读**：安装器还在推导它（对开发变体和 `--check` / `--smoke-test` 有用），但启动器启动时不再读它。它是产物记录，不再是装配来源。
-- 拖拽安装：`control::update` 已经是热更新入口，等安装流程接过来。
+- ~~拖拽安装：`control::update` 已经是热更新入口，等安装流程接过来。~~ **已取消（2026-11-21）**：不做窗口级拖放；安装/更新由启动器整体换入后重启实例，`control::update` 的启动器包装已删除（内核侧协议保留）。
 - 试用期 / 到期自动删除（另一条线，见 `dist-paid/docs/entitlement.md` §14）。
 
 ### 11.1 已验证（2026-11-18，实测输出）
