@@ -1,6 +1,7 @@
 use crate::services::outbox;
 use crate::services::ports::{Forwarder, PortBinding};
 use crate::diag::process_diagnostics::{ProcessDiagnostics, bounded, io_error};
+use job::DomainTree;
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener};
 use std::process::{Child, Command, Stdio};
@@ -18,6 +19,7 @@ use crate::router::KernelRouter;
 
 pub mod client;
 pub mod config;
+mod job;
 
 use crate::supervisor::client::DomainPipeClient;
 pub use crate::supervisor::config::{
@@ -243,6 +245,8 @@ struct ManagedProcess {
     instance_id: u64,
     pid: u32,
     child: Option<Child>,
+    /// 整棵进程树的边界。孙进程不会随 `Child::kill` 消失，也不会松开继承的输出管道。
+    tree: DomainTree,
     diagnostics: Arc<ProcessDiagnostics>,
     exit_status: Option<std::process::ExitStatus>,
     stop: Arc<AtomicBool>,
@@ -315,7 +319,10 @@ impl ManagedProcess {
             let cleanup = self.exit_status.is_none();
             if cleanup {
                 self.diagnostics
-                    .record("cleanup_requested", json!({"action":"kill"}), false);
+                    .record("cleanup_requested", json!({"action":"terminate_tree"}), false);
+                // 先拆整棵树：孙进程继承着 stdout/stderr 写端，只杀直系子进程的话
+                // 下面的 worker.join() 会永远等不到 EOF，停了域却停不下来。
+                self.tree.terminate();
                 if let Err(error) = child.kill() {
                     self.diagnostics
                         .record("child_kill", io_error(&error), false);
@@ -339,12 +346,27 @@ impl ManagedProcess {
             }
         }
         for worker in self.workers.drain(..) {
-            if let Err(error) = worker.join() {
-                eprintln!("kernel worker panicked for pid {}: {error:?}", self.pid);
-            }
+            join_worker_bounded(worker, self.pid);
         }
     }
 }
+/// 有界 join：进程树拆掉后管道理应很快 EOF，但万一还有别处继承的句柄，
+/// 也不允许把「停域」永久卡死——超时只记录，线程留到句柄关闭时自然结束。
+fn join_worker_bounded(worker: thread::JoinHandle<()>, pid: u32) {
+    let (done, wait) = mpsc::channel();
+    let _ = thread::Builder::new()
+        .name(format!("kernel-join-{pid}"))
+        .spawn(move || {
+            let panicked = worker.join().is_err();
+            let _ = done.send(panicked);
+        });
+    match wait.recv_timeout(Duration::from_secs(5)) {
+        Ok(true) => eprintln!("kernel worker panicked for pid {pid}"),
+        Ok(false) => {}
+        Err(_) => eprintln!("kernel worker for pid {pid} did not finish after tree termination"),
+    }
+}
+
 impl Drop for ManagedProcess {
     fn drop(&mut self) {
         self.terminate();
@@ -485,6 +507,17 @@ impl DomainSupervisorInner {
             if let Some(dir) = &spec.working_dir {
                 cmd.current_dir(dir);
             }
+            // Unix：独立进程组，停域时 kill(-pid) 才能带走整棵树。
+            #[cfg(unix)]
+            unsafe {
+                use std::os::unix::process::CommandExt;
+                cmd.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
         };
 
         let command_str = if cfg!(windows) && spec.command == "python3" {
@@ -566,6 +599,8 @@ impl DomainSupervisorInner {
         }
         let (mut child, in_listener, out_listener) = self.spawn_child_endpoint(id, &child_spec)?;
         let pid = child.id();
+        // 必须在域真正跑起来之前挂上边界：它一启动就可能 Popen 孙进程。
+        let tree = DomainTree::attach(&child);
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let (sender, inbox) =
@@ -579,6 +614,7 @@ impl DomainSupervisorInner {
             instance_id: generation,
             pid,
             child: Some(child),
+            tree,
             diagnostics: Arc::new(ProcessDiagnostics::new(id, pid, generation)),
             exit_status: None,
             stop: Arc::new(AtomicBool::new(false)),
@@ -1436,6 +1472,7 @@ mod exit_drain_regression {
             instance_id: 1,
             pid,
             child: Some(child),
+            tree: DomainTree::detached(pid),
             diagnostics: Arc::new(ProcessDiagnostics::new("probe", pid, 1)),
             exit_status: None,
             stop,

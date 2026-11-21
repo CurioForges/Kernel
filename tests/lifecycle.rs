@@ -10,6 +10,8 @@ mod state_observation;
 mod ports;
 #[path = "cases/lifecycle/diagnostics.rs"]
 mod diagnostics;
+#[path = "cases/lifecycle/process_tree.rs"]
+mod process_tree;
 #[path = "cases/lifecycle/registration.rs"]
 mod registration;
 #[cfg(windows)]
