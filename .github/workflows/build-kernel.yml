@@ -2,6 +2,10 @@ name: Build Kernel and SDKs
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [master]
+    paths:
+      - '.github/workflows/build-kernel.yml'
   push:
     tags:
       - 'v*'
@@ -19,6 +23,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -60,12 +66,14 @@ jobs:
             platform: linux-x86_64
           - runner: macos-15-intel
             platform: darwin-x86_64
-          - runner: macos-14
+          - runner: macos-15
             platform: darwin-arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -91,7 +99,7 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
-          import os, pathlib, shutil, subprocess, tarfile, zipfile, tomllib
+          import json, os, pathlib, shutil, subprocess, tarfile, tomllib
           p = pathlib.Path
           version = tomllib.load(open("Cargo.toml","rb"))["package"]["version"]
           platform = os.environ["PLATFORM"]
@@ -110,6 +118,13 @@ jobs:
           binary = str((bundle / exe).resolve())
           smoke = p("dist/smoke").resolve()
           subprocess.run([binary, "--init", str(smoke)], check=True, timeout=60)
+          config = smoke / "kernel_boot.json"
+          if platform.startswith("windows"):
+              data = json.loads(config.read_text(encoding="utf-8"))
+              for domain in data["domains"]:
+                  if domain["command"] == "python3":
+                      domain["command"] = "python"
+              config.write_text(json.dumps(data, indent=2), encoding="utf-8")
           env = dict(os.environ, PYTHONPATH=str(next(p("dist/sdk").glob("*.whl")).resolve()))
           subprocess.run([binary, "--config", str(smoke / "kernel_boot.json"), "--check"], check=True, env=env, timeout=60)
           subprocess.run([binary, "--config", str(smoke / "kernel_boot.json"), "--smoke-test"], check=True, env=env, timeout=120)
