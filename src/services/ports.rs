@@ -5,6 +5,7 @@ use std::{
     collections::HashMap,
     io::{self, BufRead, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{Arc, mpsc},
     thread,
@@ -27,20 +28,28 @@ pub(crate) struct Forwarder {
     backend: Mutex<Option<SocketAddr>>,
     recovery: Mutex<()>,
 }
+/// The running kernel is the relay executable in production. Integration tests
+/// run from Cargo's internal build directory; locate the profile's public binary
+/// without assuming a fixed depth (Cargo may change its internal layout).
+fn relay_executable(current: &Path) -> io::Result<PathBuf> {
+    if current.file_stem().and_then(|s| s.to_str()) == Some("atelier-kernel") {
+        return Ok(current.to_path_buf());
+    }
+    let name = if cfg!(windows) { "atelier-kernel.exe" } else { "atelier-kernel" };
+    current
+        .ancestors()
+        .skip(1)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("cannot locate {name} in ancestor directories of {}", current.display()),
+        ))
+}
+
 impl Forwarder {
     pub fn spawn(listen: SocketAddr) -> io::Result<Arc<Self>> {
-        let mut exe = std::env::current_exe()?;
-        if exe.file_stem().and_then(|s| s.to_str()) != Some("atelier-kernel") {
-            exe = exe
-                .parent()
-                .and_then(|p| p.parent())
-                .unwrap()
-                .join(if cfg!(windows) {
-                    "atelier-kernel.exe"
-                } else {
-                    "atelier-kernel"
-                });
-        }
+        let exe = relay_executable(&std::env::current_exe()?)?;
         let mut child = Command::new(exe)
             .args(["--port-relay", &listen.to_string()])
             .stdin(Stdio::piped())
@@ -197,4 +206,24 @@ pub fn run(listen: SocketAddr) -> io::Result<()> {
     }
     // Exit the relay process, including forwarding threads, when its kernel dies.
     std::process::exit(0)
+}
+
+#[cfg(test)]
+mod executable_tests {
+    use super::*;
+
+    #[test]
+    fn relay_location_does_not_depend_on_cargo_internal_depth() {
+        let root = std::env::temp_dir().join(format!("atelier-relay-location-{}", uuid::Uuid::new_v4()));
+        let profile = root.join("target/debug");
+        let name = if cfg!(windows) { "atelier-kernel.exe" } else { "atelier-kernel" };
+        std::fs::create_dir_all(&profile).unwrap();
+        let binary = profile.join(name);
+        std::fs::write(&binary, b"fixture").unwrap();
+        assert_eq!(relay_executable(&binary).unwrap(), binary);
+        for relative in ["deps/lifecycle-123", "build/atelier_kernel/hash/out/lifecycle-456"] {
+            assert_eq!(relay_executable(&profile.join(relative)).unwrap(), binary);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
