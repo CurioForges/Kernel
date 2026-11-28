@@ -1,0 +1,170 @@
+name: Build Kernel and SDKs
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [master]
+    paths:
+      - '.github/workflows/build-kernel.yml'
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kernel-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sdk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Verify version alignment and package SDKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
+          mkdir -p dist/sdk
+          python sdk/python/build_wheel.py dist/sdk
+          (cd sdk/nodejs && npm pack --pack-destination ../../dist/sdk)
+          test -f "dist/sdk/atelier_sdk-${version}-py3-none-any.whl"
+          test -f "dist/sdk/atelier-sdk-${version}.tgz"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then test "$GITHUB_REF_NAME" = "v$version"; fi
+          python -m pip install --no-deps dist/sdk/*.whl
+          python -c 'import atelier_sdk; print(atelier_sdk.__version__)'
+          mkdir -p /tmp/atelier-sdk-check
+          npm install --ignore-scripts --prefix /tmp/atelier-sdk-check "$PWD/dist/sdk/atelier-sdk-${version}.tgz"
+          node -e "require('/tmp/atelier-sdk-check/node_modules/atelier-sdk')"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdk
+          path: dist/sdk/*
+          if-no-files-found: error
+          retention-days: 14
+
+  runtime:
+    needs: sdk
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            platform: windows-x86_64
+          - runner: ubuntu-22.04
+            platform: linux-x86_64
+          - runner: macos-15-intel
+            platform: darwin-x86_64
+          - runner: macos-15
+            platform: darwin-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Rust stable
+        run: rustup update stable && rustup default stable
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdk
+          path: dist/sdk
+      - name: Test and build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked
+          cargo build --release --locked
+      - name: Package and smoke test
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, pathlib, shutil, subprocess, tarfile, tomllib
+          p = pathlib.Path
+          version = tomllib.load(open("Cargo.toml","rb"))["package"]["version"]
+          platform = os.environ["PLATFORM"]
+          exe = "atelier-kernel.exe" if platform.startswith("windows") else "atelier-kernel"
+          bundle = p("dist/kernel-runtime")
+          bundle.mkdir(parents=True)
+          shutil.copy2(p("target/release") / exe, bundle / exe)
+          shutil.copy2("kernel_boot.json", bundle / "kernel_boot.template.json")
+          shutil.copytree("docs", bundle / "docs")
+          shutil.copytree("dist/sdk", bundle / "sdk")
+          for lang in ("python", "nodejs"):
+              dest = bundle / "sdk" / lang
+              dest.mkdir()
+              shutil.copy2(p("sdk") / lang / "README.md", dest / "README.md")
+          (bundle / "README.md").write_text(f"# Atelier Kernel {version}\nSee docs/INDEX.md for contracts and SDK documentation.\n", encoding="utf-8")
+          binary = str((bundle / exe).resolve())
+          smoke = p("dist/smoke").resolve()
+          subprocess.run([binary, "--init", str(smoke)], check=True, timeout=60)
+          config = smoke / "kernel_boot.json"
+          if platform.startswith("windows"):
+              data = json.loads(config.read_text(encoding="utf-8"))
+              for domain in data["domains"]:
+                  if domain["command"] == "python3":
+                      domain["command"] = "python"
+              config.write_text(json.dumps(data, indent=2), encoding="utf-8")
+          env = dict(os.environ, PYTHONPATH=str(next(p("dist/sdk").glob("*.whl")).resolve()))
+          subprocess.run([binary, "--config", str(smoke / "kernel_boot.json"), "--check"], check=True, env=env, timeout=60)
+          subprocess.run([binary, "--config", str(smoke / "kernel_boot.json"), "--smoke-test"], check=True, env=env, timeout=120)
+          out = p("dist/packages")
+          out.mkdir()
+          name = f"atelier-kernel-runtime-{platform}"
+          if platform.startswith("windows"):
+              shutil.make_archive(str(out / name), "zip", root_dir="dist", base_dir="kernel-runtime")
+          else:
+              with tarfile.open(out / (name + ".tar.gz"), "w:gz") as archive:
+                  archive.add(bundle, arcname="kernel-runtime")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-${{ matrix.platform }}
+          path: dist/packages/*
+          if-no-files-found: error
+          retention-days: 14
+
+  distribution:
+    needs: [sdk, runtime]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: packages
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: packages
+        run: |
+          set -euo pipefail
+          for f in *.zip *.tar.gz *.whl *.tgz; do
+            sha256sum "$f" > "$f.sha256"
+          done
+          sha256sum *.zip *.tar.gz *.whl *.tgz > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atelier-kernel-distribution
+          path: packages/*
+          if-no-files-found: error
+          retention-days: 14
